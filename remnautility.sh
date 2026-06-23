@@ -90,9 +90,8 @@ update_xray_core() {
     NODE_PATH=${NODE_PATH:-/opt/remnanode}
 
     if [ ! -d "$CUSTOM_XRAY_DIR" ]; then
-        echo -e "${RED}[!] Директория $CUSTOM_XRAY_DIR не найдена. Сначала выполните установку (пункт 1).${NC}"
-        read -p "Нажмите Enter..."
-        return
+        echo -e "${YELLOW}[*] Директория $CUSTOM_XRAY_DIR не найдена. Создаем...${NC}"
+        mkdir -p "$CUSTOM_XRAY_DIR"
     fi
 
     read -p "Укажите версию (например, v26.6.22 или latest) [latest]: " VER
@@ -115,8 +114,30 @@ update_xray_core() {
     unzip -o Xray-linux-64.zip > /dev/null
     chmod +x xray
 
-    echo -e "${GREEN}[*] Перезапуск ноды...${NC}"
-    docker compose -f "$NODE_PATH/docker-compose.yml" restart remnanode
+    COMPOSE_FILE="$NODE_PATH/docker-compose.yml"
+    
+    if ! grep -q "$CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro" "$COMPOSE_FILE"; then
+        echo -e "${YELLOW}[*] Подключаем кастомное ядро к контейнеру...${NC}"
+        cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
+        
+        if grep -q "^[[:space:]]*volumes:" "$COMPOSE_FILE"; then
+            sed -i "/^[[:space:]]*volumes:/a \\
+      - $CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro" "$COMPOSE_FILE"
+        else
+            cat <<EOF >> "$COMPOSE_FILE"
+    volumes:
+      - $CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro
+EOF
+        fi
+        
+        echo -e "${GREEN}[*] Пересоздаем контейнер для применения новых volumes...${NC}"
+        docker compose -f "$COMPOSE_FILE" down
+        docker compose -f "$COMPOSE_FILE" up -d
+    else
+        echo -e "${GREEN}[*] Перезапуск ноды...${NC}"
+        docker compose -f "$COMPOSE_FILE" restart remnanode
+    fi
+
     echo -e "${GREEN}✅ Ядро Xray успешно обновлено до $VER и применено.${NC}"
     
     read -p "Нажмите Enter, чтобы вернуться в меню..."
