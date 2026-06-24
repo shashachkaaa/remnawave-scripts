@@ -196,6 +196,68 @@ renew_certs() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+switch_branch() {
+    echo -e "\n${CYAN}=== Переключение ветки (stable <-> dev) ===${NC}"
+    
+    echo -e "Что будем переключать?"
+    echo -e "  ${YELLOW}1.${NC} Ноду (стандартно /opt/remnanode)"
+    echo -e "  ${YELLOW}2.${NC} Панель (стандартно /opt/remnawave)"
+    echo -e "  ${YELLOW}3.${NC} Свой кастомный путь"
+    read -p "Выберите цель (1-3): " target_choice
+
+    case $target_choice in
+        1) DEFAULT_PATH="/opt/remnanode" ;;
+        2) DEFAULT_PATH="/opt/remnawave" ;;
+        3) DEFAULT_PATH="" ;;
+        *) echo -e "${RED}Неверный выбор.${NC}"; sleep 1; return ;;
+    esac
+
+    read -p "Подтвердите или измените путь [$DEFAULT_PATH]: " NODE_PATH
+    NODE_PATH=${NODE_PATH:-$DEFAULT_PATH}
+    COMPOSE_FILE="$NODE_PATH/docker-compose.yml"
+
+    if [ ! -f "$COMPOSE_FILE" ]; then
+        echo -e "${RED}[!] Файл $COMPOSE_FILE не найден. Проверьте путь.${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    echo -e "\n  ${YELLOW}1.${NC} Перейти на DEV ветку (:dev)"
+    echo -e "  ${YELLOW}2.${NC} Вернуться на стабильную ветку (node:latest / backend:2)"
+    read -p "Выберите действие (1-2): " branch_choice
+
+    cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
+
+    case $branch_choice in
+        1)
+            echo -e "${YELLOW}[*] Изменение тегов на :dev...${NC}"
+            sed -i -E 's|remnawave/node:[a-zA-Z0-9_.-]+|remnawave/node:dev|g' "$COMPOSE_FILE"
+            sed -i -E 's|remnawave/backend:[a-zA-Z0-9_.-]+|remnawave/backend:dev|g' "$COMPOSE_FILE"
+            ;;
+        2)
+            echo -e "${YELLOW}[*] Изменение тегов на стабильные...${NC}"
+            sed -i -E 's|remnawave/node:[a-zA-Z0-9_.-]+|remnawave/node:latest|g' "$COMPOSE_FILE"
+            sed -i -E 's|remnawave/backend:[a-zA-Z0-9_.-]+|remnawave/backend:2|g' "$COMPOSE_FILE"
+            ;;
+        *)
+            echo -e "${RED}Неверный выбор.${NC}"
+            read -p "Нажмите Enter..."
+            return
+            ;;
+    esac
+
+    echo -e "${GREEN}[*] Скачивание обновленных образов...${NC}"
+    docker compose -f "$COMPOSE_FILE" pull
+    
+    echo -e "${GREEN}[*] Применение изменений...${NC}"
+    docker compose -f "$COMPOSE_FILE" down
+    docker compose -f "$COMPOSE_FILE" up -d
+
+    echo -e "${GREEN}✅ Готово! Ветка успешно переключена.${NC}"
+    read -p "Нажмите Enter, чтобы вернуться в меню..."
+}
+
+
 while true; do
     clear
     
@@ -211,10 +273,11 @@ while true; do
     echo -e "  ${YELLOW}3.${NC} Перезапустить ноду (Restart)"
     echo -e "  ${YELLOW}4.${NC} Посмотреть логи (Logs)"
     echo -e "  ${YELLOW}5.${NC} Принудительно обновить SSL сертификаты"
+    echo -e "  ${YELLOW}6.${NC} Переключить ветку обновлений (latest / dev)"
     echo -e "  ${YELLOW}0.${NC} Выход"
     echo -e "${CYAN}================================================================${NC}"
     
-    read -p "Выберите действие (0-5): " choice
+    read -p "Выберите действие (0-6): " choice
 
     case $choice in
         1) setup_hysteria2 ;;
@@ -222,12 +285,13 @@ while true; do
         3) restart_node ;;
         4) view_logs ;;
         5) renew_certs ;;
+        6) switch_branch ;;
         0) 
             echo -e "${GREEN}Выход. Хорошего дня!${NC}"
             exit 0 
             ;;
         *) 
-            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 5.${NC}"
+            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 6.${NC}"
             sleep 2
             ;;
     esac
