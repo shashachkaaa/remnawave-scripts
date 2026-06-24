@@ -13,20 +13,26 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "${GREEN}[*] Лечение системы и блокировка конфликтов Nginx...${NC}"
-set +e
-systemctl mask nginx.service >/dev/null 2>&1 || true
-dpkg --configure -a >/dev/null 2>&1
-apt-get --fix-broken install -y -qq >/dev/null 2>&1
-apt-get purge -y -qq nginx nginx-common nginx-core nginx-full >/dev/null 2>&1
-apt-get autoremove -y -qq >/dev/null 2>&1
-systemctl unmask nginx.service >/dev/null 2>&1 || true
-set -e
+safe_apt_install() {
+    echo -e "${GREEN}[*] Проверка состояния системы и установка пакетов ($@)...${NC}"
+    
+    set +e
+    systemctl mask nginx.service >/dev/null 2>&1 || true
+    dpkg --configure -a >/dev/null 2>&1
+    apt-get --fix-broken install -y -qq >/dev/null 2>&1
+    systemctl unmask nginx.service >/dev/null 2>&1 || true
+    set -e
 
-echo -e "${GREEN}[*] Установка необходимых пакетов (unzip, certbot, curl, figlet)...${NC}"
-apt-get update -y -qq
-apt-get install unzip curl figlet -y -qq
-apt-get install certbot -y -qq --no-install-recommends
+    apt-get update -y -qq
+    
+    for pkg in "$@"; do
+        if [ "$pkg" = "certbot" ]; then
+            apt-get install certbot -y -qq --no-install-recommends
+        else
+            apt-get install "$pkg" -y -qq
+        fi
+    done
+}
 
 setup_hysteria2() {
     echo -e "\n${CYAN}=== Настройка ноды под Hysteria2 ===${NC}"
@@ -39,6 +45,8 @@ setup_hysteria2() {
     done
 
     read -p "Укажите доменное имя (например, node.domain.com): " DOMAIN
+
+    safe_apt_install unzip certbot figlet
 
     CUSTOM_XRAY_DIR="$NODE_PATH/custom-xray"
     echo -e "${GREEN}[*] Создание директории $CUSTOM_XRAY_DIR...${NC}"
@@ -106,6 +114,8 @@ update_xray_core() {
     
     read -p "Введите корневой путь папки ноды для перезапуска [/opt/remnanode]: " NODE_PATH
     NODE_PATH=${NODE_PATH:-/opt/remnanode}
+
+    safe_apt_install curl unzip figlet
 
     if [ ! -d "$CUSTOM_XRAY_DIR" ]; then
         echo -e "${YELLOW}[*] Директория $CUSTOM_XRAY_DIR не найдена. Создаем...${NC}"
@@ -190,6 +200,13 @@ view_logs() {
 
 renew_certs() {
     echo -e "\n${CYAN}=== Обновление сертификатов Let's Encrypt ===${NC}"
+    
+    if ! command -v certbot &> /dev/null; then
+        echo -e "${RED}[!] Certbot не установлен. Пожалуйста, сначала выполните настройку (пункт 1).${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+    
     certbot renew --force-renewal
     echo -e "${GREEN}✅ Процесс обновления завершен.${NC}"
     
@@ -257,7 +274,6 @@ switch_branch() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
-
 while true; do
     clear
     
@@ -273,7 +289,7 @@ while true; do
     echo -e "  ${YELLOW}3.${NC} Перезапустить ноду (Restart)"
     echo -e "  ${YELLOW}4.${NC} Посмотреть логи (Logs)"
     echo -e "  ${YELLOW}5.${NC} Принудительно обновить SSL сертификаты"
-    echo -e "  ${YELLOW}6.${NC} Переключить ветку обновлений (latest / dev)"
+    echo -e "  ${YELLOW}6.${NC} Переключить ветку обновлений (stable / dev)"
     echo -e "  ${YELLOW}0.${NC} Выход"
     echo -e "${CYAN}================================================================${NC}"
     
