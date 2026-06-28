@@ -9,22 +9,19 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[!] Ошибка: Пожалуйста, запустите скрипт с правами root (sudo bash <...).${NC}"
-  exit 1
+    echo -e "${RED}[!] Ошибка: Пожалуйста, запустите скрипт с правами root (sudo bash <...).${NC}"
+    exit 1
 fi
 
 safe_apt_install() {
     echo -e "${GREEN}[*] Проверка состояния системы и установка пакетов ($@)...${NC}"
-    
     set +e
     systemctl mask nginx.service >/dev/null 2>&1 || true
     dpkg --configure -a >/dev/null 2>&1
     apt-get --fix-broken install -y -qq >/dev/null 2>&1
     systemctl unmask nginx.service >/dev/null 2>&1 || true
     set -e
-
     apt-get update -y -qq
-    
     for pkg in "$@"; do
         if [ "$pkg" = "certbot" ]; then
             apt-get install certbot -y -qq --no-install-recommends
@@ -36,7 +33,7 @@ safe_apt_install() {
 
 setup_hysteria2() {
     echo -e "\n${CYAN}=== Настройка ноды под Hysteria2 ===${NC}"
-
+    
     while true; do
         read -p "Введите корневой путь папки ноды [/opt/remnanode]: " NODE_PATH
         NODE_PATH=${NODE_PATH:-/opt/remnanode}
@@ -46,17 +43,7 @@ setup_hysteria2() {
 
     read -p "Укажите доменное имя (например, node.domain.com): " DOMAIN
 
-    safe_apt_install unzip certbot figlet
-
-    CUSTOM_XRAY_DIR="$NODE_PATH/custom-xray"
-    echo -e "${GREEN}[*] Создание директории $CUSTOM_XRAY_DIR...${NC}"
-    mkdir -p "$CUSTOM_XRAY_DIR"
-    cd "$CUSTOM_XRAY_DIR"
-
-    echo -e "${GREEN}[*] Скачивание и распаковка Xray-core (v26.6.22)...${NC}"
-    wget -qO Xray-linux-64.zip "https://github.com/XTLS/Xray-core/releases/download/v26.6.22/Xray-linux-64.zip"
-    unzip -o Xray-linux-64.zip > /dev/null
-    chmod +x xray
+    safe_apt_install certbot figlet
 
     CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
@@ -73,36 +60,36 @@ setup_hysteria2() {
     echo -e "${GREEN}[*] Настройка $COMPOSE_FILE...${NC}"
     cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
 
-    sed -i '/\/usr\/local\/bin\/xray:ro/d' "$COMPOSE_FILE"
+    echo -e "${YELLOW}[*] Переключение ветки ноды на dev...${NC}"
+    sed -i -E 's|remnawave/node:[a-zA-Z0-9_.-]+|remnawave/node:dev|g' "$COMPOSE_FILE"
+
     sed -i '/\/var\/lib\/remnawave\/configs\/xray\/ssl/d' "$COMPOSE_FILE"
 
     if grep -q "^[[:space:]]*volumes:" "$COMPOSE_FILE"; then
         VOL_INDENT=$(grep -m 1 "^[[:space:]]*volumes:" "$COMPOSE_FILE" | sed -E 's/^([[:space:]]*).*/\1/')
-        ITEM_INDENT="${VOL_INDENT}    "
-        
+        ITEM_INDENT="${VOL_INDENT}  "
         sed -i "/^[[:space:]]*volumes:/a \\
-${ITEM_INDENT}- $CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro\\
 ${ITEM_INDENT}- $CERT_PATH:/var/lib/remnawave/configs/xray/ssl/cert.pem:ro\\
 ${ITEM_INDENT}- $KEY_PATH:/var/lib/remnawave/configs/xray/ssl/cert.key:ro" "$COMPOSE_FILE"
     else
         BASE_INDENT=$(grep -m 1 "^[[:space:]]*\(environment\|restart\|image\):" "$COMPOSE_FILE" | sed -E 's/^([[:space:]]*).*/\1/')
         BASE_INDENT=${BASE_INDENT:-"    "}
-        ITEM_INDENT="${BASE_INDENT}    "
-        
-cat <<EOF >> "$COMPOSE_FILE"
+        ITEM_INDENT="${BASE_INDENT}  "
+        cat <<EOF >> "$COMPOSE_FILE"
 ${BASE_INDENT}volumes:
-${ITEM_INDENT}- $CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro
 ${ITEM_INDENT}- $CERT_PATH:/var/lib/remnawave/configs/xray/ssl/cert.pem:ro
 ${ITEM_INDENT}- $KEY_PATH:/var/lib/remnawave/configs/xray/ssl/cert.key:ro
 EOF
     fi
 
+    echo -e "${GREEN}[*] Скачивание обновленного образа (:dev)...${NC}"
+    docker compose -f "$COMPOSE_FILE" pull
+
     echo -e "${GREEN}[*] Перезапуск контейнеров Docker...${NC}"
     docker compose -f "$COMPOSE_FILE" down
     docker compose -f "$COMPOSE_FILE" up -d
 
-    echo -e "${GREEN}✅ Готово! Установка успешно завершена.${NC}"
-    
+    echo -e "${GREEN}✅ Готово! Нода переведена на dev-ветку и настроена для Hysteria2.${NC}"
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
@@ -126,7 +113,7 @@ update_xray_core() {
     VER=${VER:-latest}
 
     cd "$CUSTOM_XRAY_DIR"
-    
+
     if [ "$VER" = "latest" ]; then
         echo -e "${GREEN}[*] Поиск последней версии...${NC}"
         VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
@@ -143,28 +130,24 @@ update_xray_core() {
     chmod +x xray
 
     COMPOSE_FILE="$NODE_PATH/docker-compose.yml"
-    
     if ! grep -q "$CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro" "$COMPOSE_FILE"; then
         echo -e "${YELLOW}[*] Подключаем кастомное ядро к конфигурации контейнера...${NC}"
         cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
         
         if grep -q "^[[:space:]]*volumes:" "$COMPOSE_FILE"; then
             VOL_INDENT=$(grep -m 1 "^[[:space:]]*volumes:" "$COMPOSE_FILE" | sed -E 's/^([[:space:]]*).*/\1/')
-            ITEM_INDENT="${VOL_INDENT}    "
-            
+            ITEM_INDENT="${VOL_INDENT}  "
             sed -i "/^[[:space:]]*volumes:/a \\
 ${ITEM_INDENT}- $CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro" "$COMPOSE_FILE"
         else
             BASE_INDENT=$(grep -m 1 "^[[:space:]]*\(environment\|restart\|image\):" "$COMPOSE_FILE" | sed -E 's/^([[:space:]]*).*/\1/')
             BASE_INDENT=${BASE_INDENT:-"    "}
-            ITEM_INDENT="${BASE_INDENT}    "
-            
-cat <<EOF >> "$COMPOSE_FILE"
+            ITEM_INDENT="${BASE_INDENT}  "
+            cat <<EOF >> "$COMPOSE_FILE"
 ${BASE_INDENT}volumes:
 ${ITEM_INDENT}- $CUSTOM_XRAY_DIR/xray:/usr/local/bin/xray:ro
 EOF
         fi
-        
         echo -e "${GREEN}[*] Пересоздаем контейнер для применения новых настроек...${NC}"
         docker compose -f "$COMPOSE_FILE" down
         docker compose -f "$COMPOSE_FILE" up -d
@@ -174,7 +157,6 @@ EOF
     fi
 
     echo -e "${GREEN}✅ Ядро Xray успешно обновлено до $VER и применено.${NC}"
-    
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
@@ -182,10 +164,8 @@ restart_node() {
     echo -e "\n${CYAN}=== Перезапуск ноды Remnawave ===${NC}"
     read -p "Введите корневой путь папки ноды [/opt/remnanode]: " NODE_PATH
     NODE_PATH=${NODE_PATH:-/opt/remnanode}
-    
     docker compose -f "$NODE_PATH/docker-compose.yml" restart remnanode
     echo -e "${GREEN}✅ Нода перезапущена.${NC}"
-    
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
@@ -193,35 +173,30 @@ view_logs() {
     echo -e "\n${CYAN}=== Логи ноды Remnawave ===${NC}"
     read -p "Введите корневой путь папки ноды [/opt/remnanode]: " NODE_PATH
     NODE_PATH=${NODE_PATH:-/opt/remnanode}
-    
     echo -e "${YELLOW}[*] Нажмите Ctrl+C для выхода из просмотра логов.${NC}"
     docker compose -f "$NODE_PATH/docker-compose.yml" logs -f --tail 50 remnanode
 }
 
 renew_certs() {
     echo -e "\n${CYAN}=== Обновление сертификатов Let's Encrypt ===${NC}"
-    
     if ! command -v certbot &> /dev/null; then
         echo -e "${RED}[!] Certbot не установлен. Пожалуйста, сначала выполните настройку (пункт 1).${NC}"
         read -p "Нажмите Enter, чтобы вернуться в меню..."
         return
     fi
-    
     certbot renew --force-renewal
     echo -e "${GREEN}✅ Процесс обновления завершен.${NC}"
-    
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
 switch_branch() {
     echo -e "\n${CYAN}=== Переключение ветки (stable <-> dev) ===${NC}"
-    
     echo -e "Что будем переключать?"
     echo -e "  ${YELLOW}1.${NC} Ноду (стандартно /opt/remnanode)"
     echo -e "  ${YELLOW}2.${NC} Панель (стандартно /opt/remnawave)"
     echo -e "  ${YELLOW}3.${NC} Свой кастомный путь"
+    
     read -p "Выберите цель (1-3): " target_choice
-
     case $target_choice in
         1) DEFAULT_PATH="/opt/remnanode" ;;
         2) DEFAULT_PATH="/opt/remnawave" ;;
@@ -274,27 +249,164 @@ switch_branch() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+setup_cdn() {
+    echo -e "\n${CYAN}=== Настройка сервера под CDN ===${NC}"
+    read -p "Укажите доменное имя (например, cdn.domain.com): " DOMAIN
+    
+    read -p "Введите значение cookie session_id [0d6a801620c8a37976d91d67ea04cadd]: " COOKIE_VAL
+    COOKIE_VAL=${COOKIE_VAL:-0d6a801620c8a37976d91d67ea04cadd}
+
+    safe_apt_install nginx certbot
+
+    CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+    echo -e "${YELLOW}[*] Временная остановка Nginx для выпуска сертификата...${NC}"
+    systemctl stop nginx >/dev/null 2>&1 || true
+
+    if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
+        echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
+    else
+        echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN через Certbot...${NC}"
+        certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email
+    fi
+
+    echo -e "${GREEN}[*] Настройка заглушки веб-сервера (/var/www/html)...${NC}"
+    mkdir -p /var/www/html
+    cat <<EOF > /var/www/html/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to the Network</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding-top: 10%; margin: 0; }
+        .container { background: #fff; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 600px; width: 80%; }
+        h1 { color: #2c3e50; font-size: 2em; margin-bottom: 10px; }
+        p { color: #7f8c8d; font-size: 1.1em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Server is Running</h1>
+        <p>The network endpoint has been successfully configured and is actively responding.</p>
+    </div>
+</body>
+</html>
+EOF
+
+    NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
+    echo -e "${GREEN}[*] Создание конфигурации Nginx ($NGINX_CONF)...${NC}"
+
+    cat <<EOF > "$NGINX_CONF"
+map \$cookie_session_id \$is_vpn {
+    default 0;
+    "$COOKIE_VAL" 1;
+}
+
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+
+    ssl_certificate     $CERT_PATH;
+    ssl_certificate_key $KEY_PATH;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    tcp_nodelay on;
+    tcp_nopush on;
+    client_max_body_size 10m;
+    keepalive_timeout 75s;
+
+    if (\$is_vpn = 1) {
+        return 418;
+    }
+
+    location / {
+        root /var/www/html;
+        index index.html;
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    location @vpn {
+        proxy_pass http://127.0.0.1:10085;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Cookie \$http_cookie;
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        access_log off;
+    }
+
+    error_page 418 = @vpn;
+}
+EOF
+
+    echo -e "${GREEN}[*] Применение конфигурации Nginx...${NC}"
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/"
+
+    if nginx -t >/dev/null 2>&1; then
+        echo -e "${GREEN}[*] Конфигурация Nginx корректна, запуск службы...${NC}"
+        systemctl start nginx
+        systemctl enable nginx >/dev/null 2>&1
+        echo -e "${GREEN}✅ Настройка сервера под CDN успешно завершена!${NC}"
+    else
+        echo -e "${RED}[!] Ошибка в конфигурации Nginx. Проверьте вручную командой: nginx -t${NC}"
+        systemctl start nginx >/dev/null 2>&1 || true
+    fi
+
+    read -p "Нажмите Enter, чтобы вернуться в меню..."
+}
+
 while true; do
     clear
-    
     echo -e "${CYAN}"
-    figlet -c "REMNAUTILITY" 2>/dev/null || echo -e "               REMNAUTILITY                 "
+    figlet -c "REMNAUTILITY" 2>/dev/null || echo -e "  REMNAUTILITY  "
     echo -e "${NC}"
-
     echo -e "${CYAN}================================================================${NC}"
-    echo -e "${GREEN}               Remnawave + Hysteria2 Управление                 ${NC}"
+    echo -e "${GREEN}             Remnawave + Hysteria2 Управление             ${NC}"
     echo -e "${CYAN}================================================================${NC}"
-    echo -e "  ${YELLOW}1.${NC} Настройка ноды под Hysteria2 (С нуля)"
+    echo -e "  ${YELLOW}1.${NC} Настройка ноды под Hysteria2 (через ветку DEV)"
     echo -e "  ${YELLOW}2.${NC} Обновить ядро Xray и применить"
     echo -e "  ${YELLOW}3.${NC} Перезапустить ноду (Restart)"
     echo -e "  ${YELLOW}4.${NC} Посмотреть логи (Logs)"
     echo -e "  ${YELLOW}5.${NC} Принудительно обновить SSL сертификаты"
     echo -e "  ${YELLOW}6.${NC} Переключить ветку обновлений (stable / dev)"
+    echo -e "  ${YELLOW}7.${NC} Настройка сервера под CDN"
     echo -e "  ${YELLOW}0.${NC} Выход"
     echo -e "${CYAN}================================================================${NC}"
     
-    read -p "Выберите действие (0-6): " choice
-
+    read -p "Выберите действие (0-7): " choice
     case $choice in
         1) setup_hysteria2 ;;
         2) update_xray_core ;;
@@ -302,13 +414,14 @@ while true; do
         4) view_logs ;;
         5) renew_certs ;;
         6) switch_branch ;;
+        7) setup_cdn ;;
         0) 
             echo -e "${GREEN}Выход. Хорошего дня!${NC}"
             exit 0 
             ;;
         *) 
-            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 6.${NC}"
-            sleep 2
+            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 7.${NC}"
+            sleep 2 
             ;;
     esac
 done
