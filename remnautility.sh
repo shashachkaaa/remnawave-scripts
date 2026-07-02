@@ -8,9 +8,42 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+# Проверка на root
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[!] Ошибка: Пожалуйста, запустите скрипт с правами root (sudo bash <...).${NC}"
     exit 1
+fi
+
+# Автоустановка и автообновление
+SCRIPT_PATH=$(realpath "$0")
+DEST_PATH="/usr/local/bin/remnautility"
+UPDATE_URL="https://raw.githubusercontent.com/shashachkaaa/remnawave-scripts/refs/heads/main/remnautility.sh"
+
+if [ "$SCRIPT_PATH" != "$DEST_PATH" ]; then
+    cp "$SCRIPT_PATH" "$DEST_PATH"
+    chmod +x "$DEST_PATH"
+    echo -e "${GREEN}[*] Скрипт установлен в систему. Теперь вы можете вызывать его командой 'remnautility' из любого места.${NC}"
+    sleep 2
+else
+    echo -e "${CYAN}[*] Проверка обновлений скрипта...${NC}"
+    set +e # Отключаем прерывание при ошибке для безопасной проверки
+    TMP_FILE=$(mktemp)
+    curl -sL "$UPDATE_URL" -o "$TMP_FILE"
+    
+    # Проверяем, что скачался именно bash-скрипт, а не заглушка или ошибка
+    if grep -q "^#!/bin/bash" "$TMP_FILE"; then
+        if ! cmp -s "$TMP_FILE" "$DEST_PATH"; then
+            echo -e "${GREEN}[*] Найдена новая версия! Обновляюсь...${NC}"
+            cat "$TMP_FILE" > "$DEST_PATH"
+            chmod +x "$DEST_PATH"
+            rm -f "$TMP_FILE"
+            echo -e "${GREEN}✅ Скрипт успешно обновлен. Перезапуск...${NC}"
+            sleep 1
+            exec "$DEST_PATH" "$@"
+        fi
+    fi
+    rm -f "$TMP_FILE"
+    set -e # Включаем прерывание обратно
 fi
 
 safe_apt_install() {
@@ -29,6 +62,14 @@ safe_apt_install() {
             apt-get install "$pkg" -y -qq
         fi
     done
+}
+
+install_node() {
+    echo -e "\n${CYAN}=== Установка ноды ===${NC}"
+    echo -e "${YELLOW}[*] Запуск внешнего скрипта установки...${NC}"
+    bash <(curl -Ls https://raw.githubusercontent.com/nerioff1337/remnawave-node-auto/refs/heads/main/install.sh)
+    echo -e "${GREEN}✅ Процесс установки завершен.${NC}"
+    read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
 setup_hysteria2() {
@@ -60,8 +101,8 @@ setup_hysteria2() {
     echo -e "${GREEN}[*] Настройка $COMPOSE_FILE...${NC}"
     cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak"
 
-    echo -e "${YELLOW}[*] Переключение ветки ноды на dev...${NC}"
-    sed -i -E 's|remnawave/node:[a-zA-Z0-9_.-]+|remnawave/node:dev|g' "$COMPOSE_FILE"
+    echo -e "${YELLOW}[*] Установка тега ноды на latest...${NC}"
+    sed -i -E 's|remnawave/node:[a-zA-Z0-9_.-]+|remnawave/node:latest|g' "$COMPOSE_FILE"
 
     sed -i '/\/var\/lib\/remnawave\/configs\/xray\/ssl/d' "$COMPOSE_FILE"
 
@@ -82,14 +123,14 @@ ${ITEM_INDENT}- $KEY_PATH:/var/lib/remnawave/configs/xray/ssl/cert.key:ro
 EOF
     fi
 
-    echo -e "${GREEN}[*] Скачивание обновленного образа (:dev)...${NC}"
+    echo -e "${GREEN}[*] Скачивание обновленного образа (:latest)...${NC}"
     docker compose -f "$COMPOSE_FILE" pull
 
     echo -e "${GREEN}[*] Перезапуск контейнеров Docker...${NC}"
     docker compose -f "$COMPOSE_FILE" down
     docker compose -f "$COMPOSE_FILE" up -d
 
-    echo -e "${GREEN}✅ Готово! Нода переведена на dev-ветку и настроена для Hysteria2.${NC}"
+    echo -e "${GREEN}✅ Готово! Нода настроена для Hysteria2 (latest ветка).${NC}"
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
@@ -180,7 +221,7 @@ view_logs() {
 renew_certs() {
     echo -e "\n${CYAN}=== Обновление сертификатов Let's Encrypt ===${NC}"
     if ! command -v certbot &> /dev/null; then
-        echo -e "${RED}[!] Certbot не установлен. Пожалуйста, сначала выполните настройку (пункт 1).${NC}"
+        echo -e "${RED}[!] Certbot не установлен. Пожалуйста, сначала выполните настройку (пункт 2).${NC}"
         read -p "Нажмите Enter, чтобы вернуться в меню..."
         return
     fi
@@ -249,145 +290,6 @@ switch_branch() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
-setup_cdn() {
-    echo -e "\n${CYAN}=== Настройка сервера под CDN ===${NC}"
-    read -p "Укажите доменное имя (например, cdn.domain.com): " DOMAIN
-    
-    read -p "Введите значение cookie session_id [0d6a801620c8a37976d91d67ea04cadd]: " COOKIE_VAL
-    COOKIE_VAL=${COOKIE_VAL:-0d6a801620c8a37976d91d67ea04cadd}
-
-    safe_apt_install nginx certbot
-
-    CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
-    echo -e "${YELLOW}[*] Временная остановка Nginx для выпуска сертификата...${NC}"
-    systemctl stop nginx >/dev/null 2>&1 || true
-
-    if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
-        echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
-    else
-        echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN через Certbot...${NC}"
-        certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email
-    fi
-
-    echo -e "${GREEN}[*] Настройка заглушки веб-сервера (/var/www/html)...${NC}"
-    mkdir -p /var/www/html
-    cat <<EOF > /var/www/html/index.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to the Network</title>
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; color: #333; text-align: center; padding-top: 10%; margin: 0; }
-        .container { background: #fff; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); display: inline-block; max-width: 600px; width: 80%; }
-        h1 { color: #2c3e50; font-size: 2em; margin-bottom: 10px; }
-        p { color: #7f8c8d; font-size: 1.1em; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Server is Running</h1>
-        <p>The network endpoint has been successfully configured and is actively responding.</p>
-    </div>
-</body>
-</html>
-EOF
-
-    NGINX_CONF="/etc/nginx/sites-available/$DOMAIN"
-    echo -e "${GREEN}[*] Создание конфигурации Nginx ($NGINX_CONF)...${NC}"
-
-    cat <<EOF > "$NGINX_CONF"
-map \$cookie_session_id \$is_vpn {
-    default 0;
-    "$COOKIE_VAL" 1;
-}
-
-server {
-    listen 80;
-    server_name $DOMAIN;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    server_name $DOMAIN;
-
-    ssl_certificate     $CERT_PATH;
-    ssl_certificate_key $KEY_PATH;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-
-    ssl_session_cache shared:SSL:50m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-
-    tcp_nodelay on;
-    tcp_nopush on;
-    client_max_body_size 10m;
-    keepalive_timeout 75s;
-
-    if (\$is_vpn = 1) {
-        return 418;
-    }
-
-    location / {
-        root /var/www/html;
-        index index.html;
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    location @vpn {
-        proxy_pass http://127.0.0.1:10085;
-        proxy_http_version 1.1;
-
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header Cookie \$http_cookie;
-
-        proxy_buffering off;
-        proxy_request_buffering off;
-
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-
-        access_log off;
-    }
-
-    error_page 418 = @vpn;
-}
-EOF
-
-    echo -e "${GREEN}[*] Применение конфигурации Nginx...${NC}"
-    rm -f /etc/nginx/sites-enabled/default
-    ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/"
-
-    if nginx -t >/dev/null 2>&1; then
-        echo -e "${GREEN}[*] Конфигурация Nginx корректна, запуск службы...${NC}"
-        systemctl start nginx
-        systemctl enable nginx >/dev/null 2>&1
-        echo -e "${GREEN}✅ Настройка сервера под CDN успешно завершена!${NC}"
-    else
-        echo -e "${RED}[!] Ошибка в конфигурации Nginx. Проверьте вручную командой: nginx -t${NC}"
-        systemctl start nginx >/dev/null 2>&1 || true
-    fi
-
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
-}
-
 while true; do
     clear
     echo -e "${CYAN}"
@@ -396,25 +298,25 @@ while true; do
     echo -e "${CYAN}================================================================${NC}"
     echo -e "${GREEN}             Remnawave + Hysteria2 Управление             ${NC}"
     echo -e "${CYAN}================================================================${NC}"
-    echo -e "  ${YELLOW}1.${NC} Настройка ноды под Hysteria2 (через ветку DEV)"
-    echo -e "  ${YELLOW}2.${NC} Обновить ядро Xray и применить"
-    echo -e "  ${YELLOW}3.${NC} Перезапустить ноду (Restart)"
-    echo -e "  ${YELLOW}4.${NC} Посмотреть логи (Logs)"
-    echo -e "  ${YELLOW}5.${NC} Принудительно обновить SSL сертификаты"
-    echo -e "  ${YELLOW}6.${NC} Переключить ветку обновлений (stable / dev)"
-    echo -e "  ${YELLOW}7.${NC} Настройка сервера под CDN"
+    echo -e "  ${YELLOW}1.${NC} Установка ноды"
+    echo -e "  ${YELLOW}2.${NC} Настройка ноды под Hysteria2 (latest)"
+    echo -e "  ${YELLOW}3.${NC} Обновить ядро Xray и применить"
+    echo -e "  ${YELLOW}4.${NC} Перезапустить ноду (Restart)"
+    echo -e "  ${YELLOW}5.${NC} Посмотреть логи (Logs)"
+    echo -e "  ${YELLOW}6.${NC} Принудительно обновить SSL сертификаты"
+    echo -e "  ${YELLOW}7.${NC} Переключить ветку обновлений (stable / dev)"
     echo -e "  ${YELLOW}0.${NC} Выход"
     echo -e "${CYAN}================================================================${NC}"
     
     read -p "Выберите действие (0-7): " choice
     case $choice in
-        1) setup_hysteria2 ;;
-        2) update_xray_core ;;
-        3) restart_node ;;
-        4) view_logs ;;
-        5) renew_certs ;;
-        6) switch_branch ;;
-        7) setup_cdn ;;
+        1) install_node ;;
+        2) setup_hysteria2 ;;
+        3) update_xray_core ;;
+        4) restart_node ;;
+        5) view_logs ;;
+        6) renew_certs ;;
+        7) switch_branch ;;
         0) 
             echo -e "${GREEN}Выход. Хорошего дня!${NC}"
             exit 0 
