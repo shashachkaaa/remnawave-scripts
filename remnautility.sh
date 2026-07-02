@@ -15,22 +15,26 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Автоустановка и автообновление
-SCRIPT_PATH=$(realpath "$0")
 DEST_PATH="/usr/local/bin/remnautility"
 UPDATE_URL="https://raw.githubusercontent.com/shashachkaaa/remnawave-scripts/refs/heads/main/remnautility.sh"
 
-if [ "$SCRIPT_PATH" != "$DEST_PATH" ]; then
-    cp "$SCRIPT_PATH" "$DEST_PATH"
+# Если скрипт запущен не из глобальной директории, скачиваем его туда
+if [[ "$(realpath "$0" 2>/dev/null)" != "$DEST_PATH" && "$0" != "remnautility" ]]; then
+    echo -e "${YELLOW}[*] Выполняется установка скрипта в систему...${NC}"
+    curl -sL "$UPDATE_URL" -o "$DEST_PATH"
     chmod +x "$DEST_PATH"
-    echo -e "${GREEN}[*] Скрипт установлен в систему. Теперь вы можете вызывать его командой 'remnautility' из любого места.${NC}"
+    echo -e "${GREEN}[*] Скрипт установлен! Теперь вы можете вызывать его командой 'remnautility' из любого места.${NC}"
+    echo -e "${GREEN}[*] Запускаю установленную версию...${NC}"
     sleep 2
+    exec "$DEST_PATH" "$@"
 else
+    # Если скрипт уже установлен, проверяем наличие обновлений
     echo -e "${CYAN}[*] Проверка обновлений скрипта...${NC}"
     set +e # Отключаем прерывание при ошибке для безопасной проверки
     TMP_FILE=$(mktemp)
     curl -sL "$UPDATE_URL" -o "$TMP_FILE"
     
-    # Проверяем, что скачался именно bash-скрипт, а не заглушка или ошибка
+    # Проверяем, что скачался именно bash-скрипт
     if grep -q "^#!/bin/bash" "$TMP_FILE"; then
         if ! cmp -s "$TMP_FILE" "$DEST_PATH"; then
             echo -e "${GREEN}[*] Найдена новая версия! Обновляюсь...${NC}"
