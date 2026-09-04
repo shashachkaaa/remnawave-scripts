@@ -184,6 +184,169 @@ ensure_certbot() {
     return 1
 }
 
+# --- Диагностика ACME (HTTP-01 / порт 80) ---------------------------------
+
+# Кто слушает порт $1 (пусто, если никто или нет ss/netstat)
+port_listener_info() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnp 2>/dev/null | tail -n +2 | awk -v p=":${port}\$" '$4 ~ p'
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltnp 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p'
+    fi
+}
+
+port_is_busy() {
+    if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
+        [ -n "$(port_listener_info "$1")" ]
+        return
+    fi
+    # Запасной вариант без ss/netstat: пробуем подключиться
+    if (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1; then
+        exec 3<&- 3>&-
+        return 0
+    fi
+    return 1
+}
+
+# Внешний IP этого сервера
+detect_public_ip() {
+    local url ip
+    for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+        ip=$(curl -4 -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# A-запись домена
+resolve_domain_ip() {
+    if command -v dig >/dev/null 2>&1; then
+        dig +short A "$1" 2>/dev/null | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | tail -n 1
+    else
+        getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'
+    fi
+}
+
+# Открыть 80/tcp в управляемом файрволе (ufw / firewalld) — с подтверждением
+firewall_allow_http() {
+    local answer
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW'; then
+            echo -e "${GREEN}[*] ufw активен, 80/tcp уже разрешён.${NC}"
+        else
+            echo -e "${YELLOW}[!] ufw активен, но правила для 80/tcp нет — Let's Encrypt не достучится.${NC}"
+            read -p "Открыть 80/tcp в ufw (нужно и для автопродления)? (y/n): " answer
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                ufw allow 80/tcp >/dev/null 2>&1 && echo -e "${GREEN}[*] ufw: 80/tcp открыт.${NC}"
+            fi
+        fi
+        return 0
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --query-port=80/tcp >/dev/null 2>&1; then
+            echo -e "${GREEN}[*] firewalld активен, 80/tcp уже разрешён.${NC}"
+        else
+            echo -e "${YELLOW}[!] firewalld активен, 80/tcp закрыт.${NC}"
+            read -p "Открыть 80/tcp в firewalld? (y/n): " answer
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1
+                firewall-cmd --reload >/dev/null 2>&1
+                echo -e "${GREEN}[*] firewalld: 80/tcp открыт.${NC}"
+            fi
+        fi
+        return 0
+    fi
+
+    # Голый iptables/nftables не трогаем автоматически — только предупреждаем
+    if iptables -S INPUT 2>/dev/null | head -n 1 | grep -q -- "-P INPUT DROP"; then
+        if ! iptables -S INPUT 2>/dev/null | grep -qE -- "--dport 80 .*-j (ACCEPT|RETURN)"; then
+            echo -e "${YELLOW}[!] Политика iptables INPUT = DROP, явного правила для 80/tcp нет.${NC}"
+            echo -e "${YELLOW}    Откройте порт вручную: iptables -I INPUT -p tcp --dport 80 -j ACCEPT${NC}"
+        fi
+    fi
+    return 0
+}
+
+# Проверки перед выпуском сертификата
+acme_preflight() {
+    local domain="$1" server_ip domain_ip busy
+    echo -e "${CYAN}[*] Предварительная проверка перед выпуском сертификата...${NC}"
+
+    domain_ip=$(resolve_domain_ip "$domain")
+    if [ -z "$domain_ip" ]; then
+        echo -e "${RED}[!] Домен $domain не резолвится в IPv4. Проверьте A-запись.${NC}"
+    else
+        server_ip=$(detect_public_ip) || server_ip=""
+        if [ -z "$server_ip" ]; then
+            echo -e "${YELLOW}[*] Домен $domain -> $domain_ip (внешний IP сервера определить не удалось).${NC}"
+        elif [ "$server_ip" = "$domain_ip" ]; then
+            echo -e "${GREEN}[*] ✅ Домен $domain -> $domain_ip совпадает с IP сервера.${NC}"
+        else
+            echo -e "${RED}[!] Домен $domain указывает на $domain_ip, а внешний IP сервера — $server_ip.${NC}"
+            echo -e "${RED}    Если перед сервером нет прокси/NAT, проверка Let's Encrypt не пройдёт.${NC}"
+        fi
+    fi
+
+    busy=$(port_listener_info 80)
+    if [ -n "$busy" ]; then
+        echo -e "${RED}[!] Порт 80/tcp занят — standalone-режим certbot не сможет его открыть:${NC}"
+        echo "$busy"
+        echo -e "${YELLOW}    Остановите этот сервис на время выпуска сертификата.${NC}"
+    else
+        echo -e "${GREEN}[*] ✅ Порт 80/tcp свободен.${NC}"
+    fi
+
+    firewall_allow_http
+}
+
+# Подсказки, если проверка Let's Encrypt не прошла
+acme_failure_hints() {
+    local domain="$1"
+    echo -e "${YELLOW}[*] Диагностика:${NC}"
+    echo -e "${YELLOW}    'Timeout during connect' означает, что пакеты на 80/tcp дропаются файрволом,${NC}"
+    echo -e "${YELLOW}    а не что порт занят. Проверьте по порядку:${NC}"
+    echo -e "    1) Файрвол хостинга/облака (панель управления, security group) — порт 80/tcp входящий"
+    echo -e "    2) Локальный файрвол: ufw status verbose / iptables -S / nft list ruleset"
+    if command -v cscli >/dev/null 2>&1; then
+        echo -e "    3) CrowdSec-баны: cscli decisions list"
+    fi
+    echo -e "    4) Снаружи: curl -v http://$domain/ (должно быть 'Connection refused', а не таймаут)"
+}
+
+# Выпуск сертификата с фолбэком на TLS-ALPN-01 (443/tcp), если 80 закрыт
+issue_certificate() {
+    local domain="$1" node_path="$2" answer
+    local hook="docker compose -f $node_path/docker-compose.yml restart remnanode"
+
+    if certbot certonly --standalone -d "$domain" --non-interactive --agree-tos \
+        --register-unsafely-without-email --deploy-hook "$hook"; then
+        return 0
+    fi
+
+    echo -e "${RED}[!] Проверка по HTTP-01 (порт 80/tcp) не прошла.${NC}"
+    acme_failure_hints "$domain"
+
+    if port_is_busy 443; then
+        echo -e "${YELLOW}[*] TCP/443 занят, альтернативная проверка TLS-ALPN-01 недоступна:${NC}"
+        port_listener_info 443
+        return 1
+    fi
+
+    echo -e "\n${YELLOW}[*] Если у хостера закрыт только 80 порт, можно пройти проверку по 443/tcp.${NC}"
+    echo -e "${YELLOW}    Важно: 443/tcp должен оставаться открытым и для автопродления.${NC}"
+    read -p "Попробовать альтернативный способ TLS-ALPN-01 (443/tcp)? (y/n): " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+
+    echo -e "${GREEN}[*] Повторный выпуск через TLS-ALPN-01...${NC}"
+    certbot certonly --standalone --preferred-challenges tls-alpn-01 -d "$domain" \
+        --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "$hook"
+}
+
 install_node() {
     echo -e "\n${CYAN}=== Установка ноды ===${NC}"
     echo -e "${YELLOW}[*] Запуск внешнего скрипта установки...${NC}"
@@ -217,11 +380,11 @@ setup_hysteria2() {
     if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
         echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
     else
+        acme_preflight "$DOMAIN"
+
         echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN...${NC}"
-        if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email \
-        --deploy-hook "docker compose -f $NODE_PATH/docker-compose.yml restart remnanode"; then
-            echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN.${NC}"
-            echo -e "${RED}[!] Проверьте, что домен указывает на этот сервер и порт 80 свободен.${NC}"
+        if ! issue_certificate "$DOMAIN" "$NODE_PATH"; then
+            echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN. Конфигурация ноды не изменена.${NC}"
             read -p "Нажмите Enter, чтобы вернуться в меню..."
             return
         fi
@@ -362,6 +525,7 @@ renew_certs() {
 
     if ! certbot renew --force-renewal; then
         echo -e "${RED}[!] Обновление сертификатов завершилось с ошибкой (см. вывод выше).${NC}"
+        acme_failure_hints "вашего домена"
         read -p "Нажмите Enter, чтобы вернуться в меню..."
         return
     fi
