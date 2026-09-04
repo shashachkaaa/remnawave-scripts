@@ -68,6 +68,122 @@ safe_apt_install() {
     done
 }
 
+# Сопоставление python-модуля с deb-пакетом (Debian/Ubuntu)
+py_module_to_deb() {
+    case "$1" in
+        pytz)                     echo "python3-tz" ;;
+        pyrfc3339)                echo "python3-rfc3339" ;;
+        josepy)                   echo "python3-josepy" ;;
+        OpenSSL)                  echo "python3-openssl" ;;
+        cryptography)             echo "python3-cryptography" ;;
+        configargparse)           echo "python3-configargparse" ;;
+        configobj)                echo "python3-configobj" ;;
+        parsedatetime)            echo "python3-parsedatetime" ;;
+        distro)                   echo "python3-distro" ;;
+        requests)                 echo "python3-requests" ;;
+        urllib3)                  echo "python3-urllib3" ;;
+        idna)                     echo "python3-idna" ;;
+        charset_normalizer|chardet) echo "python3-charset-normalizer" ;;
+        acme)                     echo "python3-acme" ;;
+        certbot)                  echo "python3-certbot" ;;
+        *)                        echo "" ;;
+    esac
+}
+
+# Certbot установлен И реально запускается?
+certbot_works() {
+    command -v certbot >/dev/null 2>&1 || return 1
+    certbot --version >/dev/null 2>&1
+}
+
+# Имя python-модуля, которого не хватает certbot (пусто, если проблема в другом)
+certbot_missing_module() {
+    certbot --version 2>&1 | sed -nE "s/.*ModuleNotFoundError: No module named '([^']+)'.*/\1/p" | tail -n 1
+}
+
+# Починка сломанной системной установки certbot (например, ModuleNotFoundError: pytz)
+repair_certbot() {
+    echo -e "${YELLOW}[*] Certbot установлен, но не запускается. Пробую восстановить зависимости...${NC}"
+    set +e
+    dpkg --configure -a >/dev/null 2>&1
+    apt-get --fix-broken install -y -qq >/dev/null 2>&1
+
+    local attempt module pkg last_module=""
+    for attempt in 1 2 3 4 5; do
+        certbot_works && break
+        module=$(certbot_missing_module)
+        [ -z "$module" ] && break
+        # Пакет уже ставили, а модуль всё ещё отсутствует — точечный ремонт не помогает
+        [ "$module" = "$last_module" ] && break
+        last_module="$module"
+        pkg=$(py_module_to_deb "$module")
+        if [ -z "$pkg" ]; then
+            echo -e "${RED}[!] Неизвестный отсутствующий модуль: $module${NC}"
+            break
+        fi
+        echo -e "${YELLOW}[*] Не хватает модуля '$module' -> ставлю пакет $pkg...${NC}"
+        apt-get install -y -qq --reinstall "$pkg" >/dev/null 2>&1 || apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    done
+
+    if ! certbot_works; then
+        echo -e "${YELLOW}[*] Переустанавливаю весь стек certbot...${NC}"
+        apt-get install -y -qq --reinstall python3-tz python3-rfc3339 python3-josepy python3-openssl \
+            python3-cryptography python3-configargparse python3-configobj python3-parsedatetime \
+            python3-distro python3-requests python3-acme python3-certbot certbot >/dev/null 2>&1
+    fi
+    set -e
+    certbot_works
+}
+
+# Запасной вариант: certbot в изолированном venv (не зависит от системных python-пакетов)
+install_certbot_venv() {
+    echo -e "${YELLOW}[*] Устанавливаю certbot в изолированное окружение /opt/certbot-venv...${NC}"
+    apt-get install -y -qq python3-venv >/dev/null 2>&1
+    if [ -e /opt/certbot-venv ] && [ ! -f /opt/certbot-venv/bin/activate ]; then
+        echo -e "${RED}[!] /opt/certbot-venv существует и не является venv. Не трогаю его.${NC}"
+        return 1
+    fi
+    rm -rf /opt/certbot-venv
+    python3 -m venv /opt/certbot-venv >/dev/null 2>&1 || return 1
+    /opt/certbot-venv/bin/pip install -q --upgrade pip >/dev/null 2>&1
+    /opt/certbot-venv/bin/pip install -q certbot >/dev/null 2>&1 || return 1
+    ln -sf /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
+    hash -r
+    return 0
+}
+
+# Гарантирует наличие РАБОЧЕГО certbot: ставит, чинит, в крайнем случае — venv
+ensure_certbot() {
+    if ! command -v certbot >/dev/null 2>&1; then
+        safe_apt_install certbot
+        hash -r
+    fi
+
+    if certbot_works; then
+        return 0
+    fi
+
+    if repair_certbot; then
+        echo -e "${GREEN}[*] ✅ Certbot восстановлен ($(certbot --version 2>&1)).${NC}"
+        return 0
+    fi
+
+    set +e
+    install_certbot_venv
+    set -e
+    hash -r
+
+    if certbot_works; then
+        echo -e "${GREEN}[*] ✅ Certbot установлен через venv ($(certbot --version 2>&1)).${NC}"
+        return 0
+    fi
+
+    echo -e "${RED}[!] Не удалось получить рабочий certbot.${NC}"
+    echo -e "${RED}[!] Диагностика:${NC}"
+    certbot --version 2>&1 | tail -n 5
+    return 1
+}
+
 install_node() {
     echo -e "\n${CYAN}=== Установка ноды ===${NC}"
     echo -e "${YELLOW}[*] Запуск внешнего скрипта установки...${NC}"
@@ -88,7 +204,12 @@ setup_hysteria2() {
 
     read -p "Укажите доменное имя (например, node.domain.com): " DOMAIN
 
-    safe_apt_install certbot figlet
+    safe_apt_install figlet
+
+    if ! ensure_certbot; then
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
 
     CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
     KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
@@ -97,8 +218,13 @@ setup_hysteria2() {
         echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
     else
         echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN...${NC}"
-        certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email \
-        --deploy-hook "docker compose -f $NODE_PATH/docker-compose.yml restart remnanode"
+        if ! certbot certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email \
+        --deploy-hook "docker compose -f $NODE_PATH/docker-compose.yml restart remnanode"; then
+            echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN.${NC}"
+            echo -e "${RED}[!] Проверьте, что домен указывает на этот сервер и порт 80 свободен.${NC}"
+            read -p "Нажмите Enter, чтобы вернуться в меню..."
+            return
+        fi
     fi
 
     COMPOSE_FILE="$NODE_PATH/docker-compose.yml"
@@ -229,7 +355,16 @@ renew_certs() {
         read -p "Нажмите Enter, чтобы вернуться в меню..."
         return
     fi
-    certbot renew --force-renewal
+    if ! ensure_certbot; then
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    if ! certbot renew --force-renewal; then
+        echo -e "${RED}[!] Обновление сертификатов завершилось с ошибкой (см. вывод выше).${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
     echo -e "${GREEN}✅ Процесс обновления завершен.${NC}"
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
