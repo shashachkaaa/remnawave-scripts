@@ -685,18 +685,59 @@ switch_branch() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+# Разбор дампа: считаем ТОЛЬКО пакеты к нашему IP и от него.
+# Без этого в счётчик попадают исходящие соединения сервера к чужим 80 портам.
+analyze_capture() {
+    local log="$1" ip="$2" out
+    SYN_IN=0; SYNACK_OUT=0; SYN_SOURCES=""
+    [ -s "$log" ] || return 0
+
+    out=$(awk -v ip="$ip" '
+        {
+            src=""; dst=""
+            for (i = 2; i < NF; i++) {
+                if ($i == ">") { src = $(i-1); dst = $(i+1); break }
+            }
+            if (src == "" || dst == "") next
+            sub(/:$/, "", dst)
+            if ($0 ~ /Flags \[S\],/ && dst == ip ".80") {
+                sub(/\.[0-9]+$/, "", src)
+                n_in++; seen[src]++
+            } else if ($0 ~ /Flags \[S\.\]/ && src == ip ".80") {
+                n_out++
+            }
+        }
+        END {
+            printf "%d %d", n_in + 0, n_out + 0
+            for (h in seen) printf " %s(%d)", h, seen[h]
+            printf "\n"
+        }' "$log")
+
+    SYN_IN=$(echo "$out" | awk '{print $1}')
+    SYNACK_OUT=$(echo "$out" | awk '{print $2}')
+    SYN_SOURCES=$(echo "$out" | cut -d' ' -f3-)
+    SYN_IN=${SYN_IN:-0}
+    SYNACK_OUT=${SYNACK_OUT:-0}
+}
+
 # Прогон пробной проверки с захватом трафика на 80/tcp.
 # Возвращает в глобальных: DRY_OK, SYN_IN (входящие SYN), SYNACK_OUT (ответы сервера)
 run_acme_dry_run() {
-    local domain="$1" tcpd_log="" tcpd_pid=""
-    DRY_OK=0; SYN_IN=0; SYNACK_OUT=0; CAPTURED=0
+    local domain="$1" tcpd_log="" tcpd_pid="" filter
+    DRY_OK=0; SYN_IN=0; SYNACK_OUT=0; SYN_SOURCES=""; CAPTURED=0
 
-    if command -v tcpdump >/dev/null 2>&1; then
+    SERVER_IP=$(detect_public_ip) || SERVER_IP=""
+
+    if command -v tcpdump >/dev/null 2>&1 && [ -n "$SERVER_IP" ]; then
         tcpd_log=$(mktemp)
-        tcpdump -ni any "tcp port 80" > "$tcpd_log" 2>/dev/null &
+        filter="host $SERVER_IP and tcp port 80"
+        tcpdump -ni any "$filter" > "$tcpd_log" 2>/dev/null &
         tcpd_pid=$!
         CAPTURED=1
         sleep 1
+    elif command -v tcpdump >/dev/null 2>&1; then
+        echo -e "${YELLOW}[!] Не удалось определить внешний IP — захват трафика пропущен,${NC}"
+        echo -e "${YELLOW}    иначе в счётчик попали бы исходящие соединения сервера.${NC}"
     fi
 
     if certbot certonly --standalone --dry-run -d "$domain" --non-interactive --agree-tos \
@@ -708,10 +749,7 @@ run_acme_dry_run() {
         sleep 1
         kill "$tcpd_pid" >/dev/null 2>&1 || true
         wait "$tcpd_pid" 2>/dev/null || true
-        SYN_IN=$(grep -c "Flags \[S\]," "$tcpd_log" 2>/dev/null || true)
-        SYNACK_OUT=$(grep -c "Flags \[S\.\]" "$tcpd_log" 2>/dev/null || true)
-        SYN_IN=${SYN_IN:-0}
-        SYNACK_OUT=${SYNACK_OUT:-0}
+        analyze_capture "$tcpd_log" "$SERVER_IP"
         rm -f "$tcpd_log"
     fi
 }
@@ -780,10 +818,16 @@ diagnose_acme() {
         return
     fi
 
-    echo -e "${CYAN}[*] Пакетов на 80/tcp: входящих SYN — $SYN_IN, ответов SYN-ACK от сервера — $SYNACK_OUT.${NC}\n"
+    echo -e "${CYAN}[*] Пакеты на $SERVER_IP:80 — входящих SYN: $SYN_IN, ответов SYN-ACK: $SYNACK_OUT.${NC}"
+    if [ -n "$SYN_SOURCES" ]; then
+        echo -e "${CYAN}    Кто стучался: $SYN_SOURCES${NC}"
+        echo -e "${CYAN}    (проверка Let's Encrypt идёт с нескольких разных IP из разных стран;${NC}"
+        echo -e "${CYAN}     одиночные адреса — обычно сканеры, а не валидаторы)${NC}"
+    fi
+    echo
 
     if [ "$SYN_IN" -eq 0 ]; then
-        echo -e "${RED}[!] Ни одного входящего SYN — трафик режется ДО сервера.${NC}"
+        echo -e "${RED}[!] Ни одного входящего SYN на $SERVER_IP:80 — трафик режется ДО сервера.${NC}"
         echo -e "${RED}    Локальный файрвол ни при чём: блокирует хостер или аплинк.${NC}"
         echo -e "    Что делать:"
         echo -e "      • открыть входящий 80/tcp в панели хостера / security group"
