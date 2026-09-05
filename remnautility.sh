@@ -685,6 +685,42 @@ switch_branch() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+# Прогон пробной проверки с захватом трафика на 80/tcp.
+# Возвращает в глобальных: DRY_OK, SYN_IN (входящие SYN), SYNACK_OUT (ответы сервера)
+run_acme_dry_run() {
+    local domain="$1" tcpd_log="" tcpd_pid=""
+    DRY_OK=0; SYN_IN=0; SYNACK_OUT=0; CAPTURED=0
+
+    if command -v tcpdump >/dev/null 2>&1; then
+        tcpd_log=$(mktemp)
+        tcpdump -ni any "tcp port 80" > "$tcpd_log" 2>/dev/null &
+        tcpd_pid=$!
+        CAPTURED=1
+        sleep 1
+    fi
+
+    if certbot certonly --standalone --dry-run -d "$domain" --non-interactive --agree-tos \
+        --register-unsafely-without-email; then
+        DRY_OK=1
+    fi
+
+    if [ -n "$tcpd_pid" ]; then
+        sleep 1
+        kill "$tcpd_pid" >/dev/null 2>&1 || true
+        wait "$tcpd_pid" 2>/dev/null || true
+        SYN_IN=$(grep -c "Flags \[S\]," "$tcpd_log" 2>/dev/null || true)
+        SYNACK_OUT=$(grep -c "Flags \[S\.\]" "$tcpd_log" 2>/dev/null || true)
+        SYN_IN=${SYN_IN:-0}
+        SYNACK_OUT=${SYNACK_OUT:-0}
+        rm -f "$tcpd_log"
+    fi
+}
+
+# Есть ли активный crowdsec-firewall-bouncer
+crowdsec_bouncer_active() {
+    systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null
+}
+
 diagnose_acme() {
     echo -e "\n${CYAN}=== Диагностика выпуска сертификата ===${NC}"
     echo -e "${YELLOW}[*] Тест идёт через staging-сервер Let's Encrypt: боевые лимиты не тратятся.${NC}"
@@ -703,15 +739,10 @@ diagnose_acme() {
 
     acme_preflight "$DOMAIN"
 
-    # CrowdSec: его bouncer дропает пакеты ДО правил ufw
     if command -v cscli >/dev/null 2>&1; then
         local bans
         bans=$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | wc -l || true)
         echo -e "${CYAN}[*] CrowdSec: активных решений — ${bans:-?}.${NC}"
-        if nft list tables 2>/dev/null | grep -qi crowdsec || ipset list -n 2>/dev/null | grep -qi crowdsec; then
-            echo -e "${YELLOW}[!] Активен crowdsec-firewall-bouncer — он дропает пакеты ДО правил ufw.${NC}"
-            echo -e "${YELLOW}    Если подключены блоклисты, под бан могут попасть и валидаторы Let's Encrypt.${NC}"
-        fi
     fi
 
     if port_is_busy 80; then
@@ -720,8 +751,7 @@ diagnose_acme() {
         return
     fi
 
-    # Ловим входящие SYN на 80/tcp во время проверки
-    local tcpd_log="" tcpd_pid="" syn_count=0 answer
+    local answer
     if ! command -v tcpdump >/dev/null 2>&1; then
         read -p "Установить tcpdump? Без него причину не локализовать (y/n): " answer
         if [[ "$answer" =~ ^[Yy]$ ]]; then
@@ -730,52 +760,107 @@ diagnose_acme() {
             set -e
         fi
     fi
-    if command -v tcpdump >/dev/null 2>&1; then
-        tcpd_log=$(mktemp)
-        tcpdump -ni any "tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0" > "$tcpd_log" 2>/dev/null &
-        tcpd_pid=$!
-        sleep 1
-    fi
 
     echo -e "${GREEN}[*] Пробная проверка HTTP-01 (--dry-run)...${NC}"
-    local ok=0
-    if certbot certonly --standalone --dry-run -d "$DOMAIN" --non-interactive --agree-tos \
-        --register-unsafely-without-email; then
-        ok=1
-    fi
-
-    if [ -n "$tcpd_pid" ]; then
-        sleep 1
-        kill "$tcpd_pid" >/dev/null 2>&1 || true
-        wait "$tcpd_pid" 2>/dev/null || true
-        syn_count=$(grep -c "Flags \[S\]" "$tcpd_log" 2>/dev/null || true)
-        syn_count=${syn_count:-0}
-        rm -f "$tcpd_log"
-    fi
+    run_acme_dry_run "$DOMAIN"
 
     echo -e "\n${CYAN}================== Результат ==================${NC}"
-    if [ "$ok" = "1" ]; then
+    if [ "$DRY_OK" = "1" ]; then
         echo -e "${GREEN}✅ Проверка HTTP-01 проходит. Можно выпускать боевой сертификат — пункт 2.${NC}"
-    elif [ -z "$tcpd_pid" ]; then
+        echo -e "${CYAN}==============================================${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    if [ "$CAPTURED" != "1" ]; then
         echo -e "${RED}[!] Проверка не прошла, но без tcpdump причину определить нельзя.${NC}"
         acme_failure_hints "$DOMAIN"
-    elif [ "$syn_count" -gt 0 ]; then
-        echo -e "${YELLOW}[!] На 80/tcp пришло SYN-пакетов: $syn_count — трафик ДО сервера доходит.${NC}"
-        echo -e "${YELLOW}    Значит его роняет фильтр на самом сервере, хотя ufw порт разрешает.${NC}"
-        echo -e "    Смотрите в первую очередь:"
-        echo -e "      • crowdsec-firewall-bouncer: cscli decisions list -a | grep -i <IP из логов>"
-        echo -e "      • nft list ruleset | grep -A5 -i crowdsec"
-        echo -e "      • другие цепочки перед ufw: iptables -S | grep -v ufw"
-    else
-        echo -e "${RED}[!] На 80/tcp не пришло ни одного SYN — трафик режется ДО сервера.${NC}"
+        echo -e "${CYAN}==============================================${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    echo -e "${CYAN}[*] Пакетов на 80/tcp: входящих SYN — $SYN_IN, ответов SYN-ACK от сервера — $SYNACK_OUT.${NC}\n"
+
+    if [ "$SYN_IN" -eq 0 ]; then
+        echo -e "${RED}[!] Ни одного входящего SYN — трафик режется ДО сервера.${NC}"
         echo -e "${RED}    Локальный файрвол ни при чём: блокирует хостер или аплинк.${NC}"
-        echo -e "    Варианты:"
+        echo -e "    Что делать:"
         echo -e "      • открыть входящий 80/tcp в панели хостера / security group"
-        echo -e "      • DNS-01 через Cloudflare — порты не нужны вообще (пункт 2 предложит сам)"
-        echo -e "      • TLS-ALPN-01 по 443/tcp, если этот порт свободен"
+        echo -e "      • или выпустить сертификат через DNS-01 (пункт 2 предложит сам)"
+
+    elif [ "$SYNACK_OUT" -eq 0 ]; then
+        echo -e "${YELLOW}[!] SYN приходят, но сервер не отвечает ни одним SYN-ACK.${NC}"
+        echo -e "${YELLOW}    Пакеты дропает netfilter на самом сервере — раньше, чем правила ufw.${NC}"
+        diagnose_local_drop "$DOMAIN"
+
+    else
+        echo -e "${YELLOW}[!] Сервер отвечает (SYN-ACK: $SYNACK_OUT), но ответы не доходят до Let's Encrypt.${NC}"
+        echo -e "${YELLOW}    Входящий трафик проходит — режется ИСХОДЯЩИЙ с порта 80 либо обратный маршрут.${NC}"
+        echo -e "    Что смотреть:"
+        echo -e "      • блокировку исходящего 80/tcp у хостера (частая антиабузная мера)"
+        echo -e "      • policy routing / VPN-туннель: ip rule list; ip route show table all"
+        echo -e "      • ufw-цепочки на выход: iptables -S OUTPUT"
+        echo -e "      • обход: DNS-01 через Cloudflare (пункт 2) — портов не требует"
     fi
     echo -e "${CYAN}==============================================${NC}"
     read -p "Нажмите Enter, чтобы вернуться в меню..."
+}
+
+# SYN приходят, ответа нет: ищем, кто именно дропает
+diagnose_local_drop() {
+    local domain="$1" answer
+
+    echo -e "\n${CYAN}[*] Кандидаты на локальный дроп:${NC}"
+    if nft list tables 2>/dev/null | grep -qi crowdsec || ipset list -n 2>/dev/null | grep -qi crowdsec; then
+        echo -e "${YELLOW}    • crowdsec-firewall-bouncer — его цепочка стоит ПЕРЕД правилами ufw${NC}"
+    fi
+    if iptables -S 2>/dev/null | grep -vi ufw | grep -q -- "-j DROP"; then
+        echo -e "${YELLOW}    • сторонние DROP-правила вне ufw:${NC}"
+        iptables -S 2>/dev/null | grep -vi ufw | grep -- "-j DROP" | head -n 5 | sed 's/^/       /'
+    fi
+
+    if ! crowdsec_bouncer_active; then
+        echo -e "\n${CYAN}[*] crowdsec-firewall-bouncer не запущен — значит дело не в нём.${NC}"
+        echo -e "    Проверьте вручную: nft list ruleset | less  и  iptables -S | grep -v ufw"
+        return
+    fi
+
+    echo -e "\n${YELLOW}[*] Решающий тест: остановить crowdsec-firewall-bouncer и повторить проверку.${NC}"
+    echo -e "${YELLOW}    Он будет запущен обратно сразу после теста (займёт меньше минуты).${NC}"
+    read -p "Выполнить? (y/n): " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return
+
+    trap 'echo -e "\n${YELLOW}[*] Прерывание: возвращаю crowdsec-firewall-bouncer...${NC}"; systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1; exit 130' INT
+    echo -e "${YELLOW}[*] Останавливаю crowdsec-firewall-bouncer...${NC}"
+    systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+
+    run_acme_dry_run "$domain"
+
+    echo -e "${YELLOW}[*] Запускаю crowdsec-firewall-bouncer обратно...${NC}"
+    systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    trap - INT
+
+    if crowdsec_bouncer_active; then
+        echo -e "${GREEN}[*] ✅ crowdsec-firewall-bouncer снова работает.${NC}"
+    else
+        echo -e "${RED}[!] Не удалось запустить crowdsec-firewall-bouncer! Запустите вручную:${NC}"
+        echo -e "${RED}    systemctl start crowdsec-firewall-bouncer${NC}"
+    fi
+
+    if [ "$DRY_OK" = "1" ]; then
+        echo -e "\n${GREEN}✅ Виновник найден: без bouncer'а проверка проходит — дропает CrowdSec.${NC}"
+        echo -e "    Что делать:"
+        echo -e "      • посмотреть, за что забанены валидаторы: cscli decisions list -a"
+        echo -e "      • снять лишний бан: cscli decisions delete --ip <IP>"
+        echo -e "      • пересмотреть подключённые блоклисты: cscli collections list"
+        echo -e "    Надёжнее всего — DNS-01 (пункт 2): проверка не идёт по сети вообще,"
+        echo -e "    поэтому баны CrowdSec на неё не влияют, в том числе при автопродлении."
+    else
+        echo -e "\n${YELLOW}[!] Без bouncer'а проверка тоже не проходит — дропает не CrowdSec.${NC}"
+        echo -e "    Ищите дальше: nft list ruleset | less  и  iptables -S | grep -v ufw"
+        echo -e "    Либо обойдите проблему: DNS-01 через Cloudflare (пункт 2)."
+    fi
 }
 
 while true; do
