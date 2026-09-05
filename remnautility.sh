@@ -306,7 +306,7 @@ acme_preflight() {
 
 # Подсказки, если проверка Let's Encrypt не прошла
 acme_failure_hints() {
-    local domain="$1"
+    local domain="${1:-<ваш-домен>}"
     echo -e "${YELLOW}[*] Диагностика:${NC}"
     echo -e "${YELLOW}    'Timeout during connect' означает, что пакеты на 80/tcp дропаются файрволом,${NC}"
     echo -e "${YELLOW}    а не что порт занят. Проверьте по порядку:${NC}"
@@ -316,6 +316,7 @@ acme_failure_hints() {
         echo -e "    3) CrowdSec-баны: cscli decisions list"
     fi
     echo -e "    4) Снаружи: curl -v http://$domain/ (должно быть 'Connection refused', а не таймаут)"
+    echo -e "${YELLOW}    Точный ответ, где именно теряется трафик, даёт пункт меню 8 (диагностика).${NC}"
 }
 
 # Выпуск сертификата с фолбэком на TLS-ALPN-01 (443/tcp), если 80 закрыт
@@ -525,7 +526,7 @@ renew_certs() {
 
     if ! certbot renew --force-renewal; then
         echo -e "${RED}[!] Обновление сертификатов завершилось с ошибкой (см. вывод выше).${NC}"
-        acme_failure_hints "вашего домена"
+        acme_failure_hints ""
         read -p "Нажмите Enter, чтобы вернуться в меню..."
         return
     fi
@@ -593,6 +594,99 @@ switch_branch() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+diagnose_acme() {
+    echo -e "\n${CYAN}=== Диагностика выпуска сертификата ===${NC}"
+    echo -e "${YELLOW}[*] Тест идёт через staging-сервер Let's Encrypt: боевые лимиты не тратятся.${NC}"
+
+    read -p "Укажите доменное имя (например, node.domain.com): " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo -e "${RED}[!] Домен не указан.${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    if ! ensure_certbot; then
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    acme_preflight "$DOMAIN"
+
+    # CrowdSec: его bouncer дропает пакеты ДО правил ufw
+    if command -v cscli >/dev/null 2>&1; then
+        local bans
+        bans=$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | wc -l || true)
+        echo -e "${CYAN}[*] CrowdSec: активных решений — ${bans:-?}.${NC}"
+        if nft list tables 2>/dev/null | grep -qi crowdsec || ipset list -n 2>/dev/null | grep -qi crowdsec; then
+            echo -e "${YELLOW}[!] Активен crowdsec-firewall-bouncer — он дропает пакеты ДО правил ufw.${NC}"
+            echo -e "${YELLOW}    Если подключены блоклисты, под бан могут попасть и валидаторы Let's Encrypt.${NC}"
+        fi
+    fi
+
+    if port_is_busy 80; then
+        echo -e "${RED}[!] Порт 80/tcp занят — тест невозможен, сначала освободите порт.${NC}"
+        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        return
+    fi
+
+    # Ловим входящие SYN на 80/tcp во время проверки
+    local tcpd_log="" tcpd_pid="" syn_count=0 answer
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        read -p "Установить tcpdump? Без него причину не локализовать (y/n): " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            set +e
+            apt-get install -y -qq tcpdump >/dev/null 2>&1
+            set -e
+        fi
+    fi
+    if command -v tcpdump >/dev/null 2>&1; then
+        tcpd_log=$(mktemp)
+        tcpdump -ni any "tcp dst port 80 and tcp[tcpflags] & tcp-syn != 0" > "$tcpd_log" 2>/dev/null &
+        tcpd_pid=$!
+        sleep 1
+    fi
+
+    echo -e "${GREEN}[*] Пробная проверка HTTP-01 (--dry-run)...${NC}"
+    local ok=0
+    if certbot certonly --standalone --dry-run -d "$DOMAIN" --non-interactive --agree-tos \
+        --register-unsafely-without-email; then
+        ok=1
+    fi
+
+    if [ -n "$tcpd_pid" ]; then
+        sleep 1
+        kill "$tcpd_pid" >/dev/null 2>&1 || true
+        wait "$tcpd_pid" 2>/dev/null || true
+        syn_count=$(grep -c "Flags \[S\]" "$tcpd_log" 2>/dev/null || true)
+        syn_count=${syn_count:-0}
+        rm -f "$tcpd_log"
+    fi
+
+    echo -e "\n${CYAN}================== Результат ==================${NC}"
+    if [ "$ok" = "1" ]; then
+        echo -e "${GREEN}✅ Проверка HTTP-01 проходит. Можно выпускать боевой сертификат — пункт 2.${NC}"
+    elif [ -z "$tcpd_pid" ]; then
+        echo -e "${RED}[!] Проверка не прошла, но без tcpdump причину определить нельзя.${NC}"
+        acme_failure_hints "$DOMAIN"
+    elif [ "$syn_count" -gt 0 ]; then
+        echo -e "${YELLOW}[!] На 80/tcp пришло SYN-пакетов: $syn_count — трафик ДО сервера доходит.${NC}"
+        echo -e "${YELLOW}    Значит его роняет фильтр на самом сервере, хотя ufw порт разрешает.${NC}"
+        echo -e "    Смотрите в первую очередь:"
+        echo -e "      • crowdsec-firewall-bouncer: cscli decisions list -a | grep -i <IP из логов>"
+        echo -e "      • nft list ruleset | grep -A5 -i crowdsec"
+        echo -e "      • другие цепочки перед ufw: iptables -S | grep -v ufw"
+    else
+        echo -e "${RED}[!] На 80/tcp не пришло ни одного SYN — трафик режется ДО сервера.${NC}"
+        echo -e "${RED}    Локальный файрвол ни при чём: блокирует хостер или аплинк.${NC}"
+        echo -e "    Варианты:"
+        echo -e "      • открыть входящий 80/tcp в панели хостера / security group"
+        echo -e "      • выпустить сертификат через TLS-ALPN-01 по 443/tcp (пункт 2 предложит сам)"
+        echo -e "      • перейти на проверку DNS-01 (нужен API-токен DNS-провайдера)"
+    fi
+    echo -e "${CYAN}==============================================${NC}"
+    read -p "Нажмите Enter, чтобы вернуться в меню..."
+}
+
 while true; do
     clear
     echo -e "${CYAN}"
@@ -608,10 +702,11 @@ while true; do
     echo -e "  ${YELLOW}5.${NC} Посмотреть логи (Logs)"
     echo -e "  ${YELLOW}6.${NC} Принудительно обновить SSL сертификаты"
     echo -e "  ${YELLOW}7.${NC} Переключить ветку обновлений (stable / dev)"
+    echo -e "  ${YELLOW}8.${NC} Диагностика выпуска сертификата (без расхода лимитов)"
     echo -e "  ${YELLOW}0.${NC} Выход"
     echo -e "${CYAN}================================================================${NC}"
     
-    read -p "Выберите действие (0-7): " choice
+    read -p "Выберите действие (0-8): " choice
     case $choice in
         1) install_node ;;
         2) setup_hysteria2 ;;
@@ -620,12 +715,13 @@ while true; do
         5) view_logs ;;
         6) renew_certs ;;
         7) switch_branch ;;
+        8) diagnose_acme ;;
         0) 
             echo -e "${GREEN}Выход. Хорошего дня!${NC}"
             exit 0 
             ;;
         *) 
-            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 7.${NC}"
+            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 8.${NC}"
             sleep 2 
             ;;
     esac
