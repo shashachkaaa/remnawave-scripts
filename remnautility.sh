@@ -825,13 +825,20 @@ report_counter_deltas() {
 # Нативные nft-правила с вердиктом drop/reject (у них нет счётчиков в iptables-save)
 report_nft_drops() {
     command -v nft >/dev/null 2>&1 || return 0
-    local hits
-    hits=$(nft list ruleset 2>/dev/null | grep -nE "^[[:space:]]*[^#]*[[:space:]](drop|reject)([[:space:]]|$)" | head -n 10)
-    if [ -n "$hits" ]; then
-        echo -e "${YELLOW}    [!] Нативные nft-правила с drop/reject (в iptables-save их не видно):${NC}"
-        echo "$hits" | sed 's/^/        /'
-    else
+    local all fired
+    all=$(nft list ruleset 2>/dev/null | grep -E "^[[:space:]]*[^#]*[[:space:]](drop|reject)([[:space:]]|$)")
+    if [ -z "$all" ]; then
         echo -e "${GREEN}    ✅ Нативных nft-правил с drop/reject нет.${NC}"
+        return 0
+    fi
+    # counter packets 0 — правило ни разу не сработало
+    fired=$(echo "$all" | grep -vE "counter packets 0 " | head -n 8)
+    if [ -n "$fired" ]; then
+        echo -e "${YELLOW}    [!] nft-правила с drop/reject, которые срабатывали:${NC}"
+        echo "$fired" | sed 's/^/        /'
+    else
+        echo -e "${GREEN}    ✅ Все nft-правила с drop/reject имеют нулевые счётчики —${NC}"
+        echo -e "${GREEN}       ни одно из них не срабатывало.${NC}"
     fi
     return 0
 }
@@ -1030,9 +1037,16 @@ report_drop_evidence() {
         local rp_if
         rp_if=$(sysctl -n "net.ipv4.conf.${iface}.rp_filter" 2>/dev/null || echo "")
         if [ "$rp" = "1" ] || [ "$rp_if" = "1" ]; then
-            echo -e "${YELLOW}    [!] rp_filter в строгом режиме (all=$rp, $iface=$rp_if).${NC}"
-            echo -e "${YELLOW}        При асимметричной маршрутизации ядро молча дропает пакеты${NC}"
-            echo -e "${YELLOW}        ещё ДО правил iptables — ровно как в вашем случае.${NC}"
+            case "$iface" in
+                wg*|warp*|tun*|tap*|ppp*)
+                    echo -e "${RED}    [!] rp_filter строгий (all=$rp, $iface=$rp_if) и маршрут идёт${NC}"
+                    echo -e "${RED}        через туннель — ядро может молча дропать пакеты.${NC}"
+                    ;;
+                *)
+                    echo -e "${GREEN}    ✅ rp_filter строгий (all=$rp, $iface=$rp_if), но маршрутизация${NC}"
+                    echo -e "${GREEN}       симметричная — помехой он не является.${NC}"
+                    ;;
+            esac
         else
             echo -e "${GREEN}    ✅ rp_filter не строгий (all=$rp, $iface=$rp_if).${NC}"
         fi
@@ -1060,11 +1074,11 @@ report_drop_evidence() {
     else
         echo -e "${GREEN}    ✅ В таблице mangle блокирующих правил нет.${NC}"
     fi
-    if nft list ruleset 2>/dev/null | grep -qE "hook (prerouting|ingress)"; then
-        echo -e "${YELLOW}    [!] Есть nft-цепочки с хуком prerouting/ingress — они работают до INPUT:${NC}"
-        nft list ruleset 2>/dev/null | grep -B2 -E "hook (prerouting|ingress)" | head -n 12 | sed 's/^/        /'
+    if nft list ruleset 2>/dev/null | grep -E "hook (prerouting|ingress)" | grep -qv "policy accept"; then
+        echo -e "${YELLOW}    [!] Есть nft-цепочки prerouting/ingress не с policy accept:${NC}"
+        nft list ruleset 2>/dev/null | grep -E "hook (prerouting|ingress)" | grep -v "policy accept" | head -n 6 | sed 's/^/        /'
     else
-        echo -e "${GREEN}    ✅ nft-цепочек с хуком prerouting/ingress нет.${NC}"
+        echo -e "${GREEN}    ✅ Цепочки prerouting/ingress пропускают трафик (policy accept).${NC}"
     fi
     if [ -n "$iface" ]; then
         if ip link show "$iface" 2>/dev/null | grep -q "xdp"; then
@@ -1174,11 +1188,14 @@ diagnose_local_drop() {
     if nft list tables 2>/dev/null | grep -qi crowdsec || ipset list -n 2>/dev/null | grep -qi crowdsec; then
         echo -e "${YELLOW}    • crowdsec-firewall-bouncer — его цепочка стоит ПЕРЕД правилами ufw${NC}"
     fi
-    if iptables -S 2>/dev/null | grep -vi ufw | grep -q -- "-j DROP"; then
-        echo -e "${YELLOW}    • сторонние DROP-правила вне ufw:${NC}"
-        iptables -S 2>/dev/null | grep -vi ufw | grep -- "-j DROP" | head -n 5 | sed 's/^/       /'
-        echo -e "${CYAN}      (правила цепочки DOCKER относятся к FORWARD и на входящие${NC}"
-        echo -e "${CYAN}       соединения к самому серверу не влияют)${NC}"
+    local foreign
+    foreign=$(iptables -S 2>/dev/null | grep -vi ufw | grep -v -- "-A DOCKER" | grep -- "-j DROP" || true)
+    if [ -n "$foreign" ]; then
+        echo -e "${YELLOW}    • сторонние DROP-правила вне ufw и Docker:${NC}"
+        echo "$foreign" | head -n 5 | sed 's/^/       /'
+    else
+        echo -e "${GREEN}    • сторонних DROP-правил вне ufw нет (правила Docker работают${NC}"
+        echo -e "${GREEN}      в FORWARD и на входящие соединения к серверу не влияют)${NC}"
     fi
 
     report_drop_evidence
