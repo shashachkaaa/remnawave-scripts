@@ -807,6 +807,73 @@ diagnose_acme() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+# Сбор улик, когда SYN приходят, а SYN-ACK сервер не шлёт
+report_drop_evidence() {
+    local ip route_dev cur max iface rp
+
+    echo -e "\n${CYAN}[*] Проверяю типовые причины:${NC}"
+
+    # 1. Чужие DNAT/REDIRECT на 80 порт (например, от давно удалённого контейнера)
+    if iptables -t nat -S 2>/dev/null | grep -qE "dport 80 .*-j (DNAT|REDIRECT)"; then
+        echo -e "${RED}    [!] В таблице nat есть перенаправление 80 порта — трафик уходит не туда:${NC}"
+        iptables -t nat -S 2>/dev/null | grep -E "dport 80 .*-j (DNAT|REDIRECT)" | sed 's/^/        /'
+        echo -e "${YELLOW}        Частая причина — остаточные правила Docker от удалённого контейнера.${NC}"
+    else
+        echo -e "${GREEN}    ✅ Перенаправлений 80 порта в таблице nat нет.${NC}"
+    fi
+
+    # 2. Переполнение таблицы conntrack — новые соединения молча дропаются
+    cur=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "")
+    max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "")
+    if [ -n "$cur" ] && [ -n "$max" ] && [ "$max" -gt 0 ]; then
+        if [ "$cur" -ge $(( max * 90 / 100 )) ]; then
+            echo -e "${RED}    [!] conntrack почти переполнен: $cur из $max — новые соединения дропаются.${NC}"
+            echo -e "${YELLOW}        Лечится: sysctl -w net.netfilter.nf_conntrack_max=$(( max * 4 ))${NC}"
+        else
+            echo -e "${GREEN}    ✅ conntrack в норме: $cur из $max.${NC}"
+        fi
+    fi
+    if dmesg 2>/dev/null | tail -n 200 | grep -qi "conntrack.*table full"; then
+        echo -e "${RED}    [!] В dmesg есть 'nf_conntrack: table full, dropping packet'.${NC}"
+    fi
+
+    # 3. rp_filter при асимметричной маршрутизации (типично для VPN-нод с туннелем)
+    route_dev=$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
+    rp=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "")
+    iface="$route_dev"
+    if [ -n "$iface" ]; then
+        local rp_if
+        rp_if=$(sysctl -n "net.ipv4.conf.${iface}.rp_filter" 2>/dev/null || echo "")
+        if [ "$rp" = "1" ] || [ "$rp_if" = "1" ]; then
+            echo -e "${YELLOW}    [!] rp_filter в строгом режиме (all=$rp, $iface=$rp_if).${NC}"
+            echo -e "${YELLOW}        При асимметричной маршрутизации ядро молча дропает пакеты${NC}"
+            echo -e "${YELLOW}        ещё ДО правил iptables — ровно как в вашем случае.${NC}"
+        else
+            echo -e "${GREEN}    ✅ rp_filter не строгий (all=$rp, $iface=$rp_if).${NC}"
+        fi
+        case "$iface" in
+            wg*|warp*|tun*|tap*|ppp*)
+                echo -e "${RED}    [!] Маршрут по умолчанию идёт через туннель ($iface) — обратный трафик${NC}"
+                echo -e "${RED}        уходит не тем путём. Нужны policy-routing правила (ip rule).${NC}"
+                ;;
+            *)
+                echo -e "${GREEN}    ✅ Маршрут по умолчанию через обычный интерфейс ($iface).${NC}"
+                ;;
+        esac
+    fi
+
+    # 4. Публичный IP реально на интерфейсе? Иначе ufw-not-local дропнет пакет
+    ip=$(detect_public_ip) || ip=""
+    if [ -n "$ip" ]; then
+        if ip -4 addr show 2>/dev/null | grep -q "inet $ip/"; then
+            echo -e "${GREEN}    ✅ Публичный IP $ip назначен на интерфейс.${NC}"
+        else
+            echo -e "${YELLOW}    [!] Публичного IP $ip нет ни на одном интерфейсе — сервер за NAT.${NC}"
+            echo -e "${YELLOW}        Проверьте проброс 80/tcp на стороне хостера.${NC}"
+        fi
+    fi
+}
+
 # SYN приходят, ответа нет: ищем, кто именно дропает
 diagnose_local_drop() {
     local domain="$1" answer
@@ -818,48 +885,85 @@ diagnose_local_drop() {
     if iptables -S 2>/dev/null | grep -vi ufw | grep -q -- "-j DROP"; then
         echo -e "${YELLOW}    • сторонние DROP-правила вне ufw:${NC}"
         iptables -S 2>/dev/null | grep -vi ufw | grep -- "-j DROP" | head -n 5 | sed 's/^/       /'
+        echo -e "${CYAN}      (правила цепочки DOCKER относятся к FORWARD и на входящие${NC}"
+        echo -e "${CYAN}       соединения к самому серверу не влияют)${NC}"
     fi
 
-    if ! crowdsec_bouncer_active; then
+    report_drop_evidence
+
+    # Решающий тест 1: CrowdSec (только если bouncer реально работает)
+    if crowdsec_bouncer_active; then
+        echo -e "\n${YELLOW}[*] Решающий тест: остановить crowdsec-firewall-bouncer и повторить проверку.${NC}"
+        echo -e "${YELLOW}    Он будет запущен обратно сразу после теста (займёт меньше минуты).${NC}"
+        read -p "Выполнить? (y/n): " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            trap 'echo -e "\n${YELLOW}[*] Прерывание: возвращаю crowdsec-firewall-bouncer...${NC}"; systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1; exit 130' INT
+            echo -e "${YELLOW}[*] Останавливаю crowdsec-firewall-bouncer...${NC}"
+            systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+
+            run_acme_dry_run "$domain"
+
+            echo -e "${YELLOW}[*] Запускаю crowdsec-firewall-bouncer обратно...${NC}"
+            systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+            trap - INT
+
+            if crowdsec_bouncer_active; then
+                echo -e "${GREEN}[*] ✅ crowdsec-firewall-bouncer снова работает.${NC}"
+            else
+                echo -e "${RED}[!] Не удалось запустить crowdsec-firewall-bouncer! Запустите вручную:${NC}"
+                echo -e "${RED}    systemctl start crowdsec-firewall-bouncer${NC}"
+            fi
+
+            if [ "$DRY_OK" = "1" ]; then
+                echo -e "\n${GREEN}✅ Виновник найден: без bouncer'а проверка проходит — дропает CrowdSec.${NC}"
+                echo -e "    Что делать:"
+                echo -e "      • посмотреть баны: cscli decisions list -a"
+                echo -e "      • снять лишний бан: cscli decisions delete --ip <IP>"
+                echo -e "    Либо DNS-01 (пункт 2) — проверка не идёт по сети, баны на неё не влияют."
+                return
+            fi
+            echo -e "\n${YELLOW}[!] Без bouncer'а проверка тоже не проходит — дропает не CrowdSec.${NC}"
+        fi
+    else
         echo -e "\n${CYAN}[*] crowdsec-firewall-bouncer не запущен — значит дело не в нём.${NC}"
-        echo -e "    Проверьте вручную: nft list ruleset | less  и  iptables -S | grep -v ufw"
-        return
     fi
 
-    echo -e "\n${YELLOW}[*] Решающий тест: остановить crowdsec-firewall-bouncer и повторить проверку.${NC}"
-    echo -e "${YELLOW}    Он будет запущен обратно сразу после теста (займёт меньше минуты).${NC}"
+    # Решающий тест 2: правило ACCEPT в самом начале INPUT
+    echo -e "\n${YELLOW}[*] Решающий тест: временно поставить ACCEPT для 80/tcp первым правилом INPUT.${NC}"
+    echo -e "${YELLOW}    Это разделит два случая: дропает цепочка INPUT или что-то ДО неё${NC}"
+    echo -e "${YELLOW}    (rp_filter, conntrack, NAT). Правило снимается сразу после теста.${NC}"
     read -p "Выполнить? (y/n): " answer
     [[ "$answer" =~ ^[Yy]$ ]] || return
 
-    trap 'echo -e "\n${YELLOW}[*] Прерывание: возвращаю crowdsec-firewall-bouncer...${NC}"; systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1; exit 130' INT
-    echo -e "${YELLOW}[*] Останавливаю crowdsec-firewall-bouncer...${NC}"
-    systemctl stop crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    trap 'echo -e "\n${YELLOW}[*] Прерывание: снимаю временное правило...${NC}"; iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1; exit 130' INT
+    echo -e "${YELLOW}[*] Добавляю временное правило...${NC}"
+    iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT
 
     run_acme_dry_run "$domain"
 
-    echo -e "${YELLOW}[*] Запускаю crowdsec-firewall-bouncer обратно...${NC}"
-    systemctl start crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    echo -e "${YELLOW}[*] Снимаю временное правило...${NC}"
+    iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
     trap - INT
-
-    if crowdsec_bouncer_active; then
-        echo -e "${GREEN}[*] ✅ crowdsec-firewall-bouncer снова работает.${NC}"
+    if iptables -S INPUT 2>/dev/null | grep -q -- "-A INPUT -p tcp -m tcp --dport 80 -j ACCEPT"; then
+        echo -e "${RED}[!] Временное правило могло остаться. Проверьте: iptables -S INPUT | grep 'dport 80'${NC}"
     else
-        echo -e "${RED}[!] Не удалось запустить crowdsec-firewall-bouncer! Запустите вручную:${NC}"
-        echo -e "${RED}    systemctl start crowdsec-firewall-bouncer${NC}"
+        echo -e "${GREEN}[*] ✅ Временное правило снято.${NC}"
     fi
 
     if [ "$DRY_OK" = "1" ]; then
-        echo -e "\n${GREEN}✅ Виновник найден: без bouncer'а проверка проходит — дропает CrowdSec.${NC}"
-        echo -e "    Что делать:"
-        echo -e "      • посмотреть, за что забанены валидаторы: cscli decisions list -a"
-        echo -e "      • снять лишний бан: cscli decisions delete --ip <IP>"
-        echo -e "      • пересмотреть подключённые блоклисты: cscli collections list"
-        echo -e "    Надёжнее всего — DNS-01 (пункт 2): проверка не идёт по сети вообще,"
-        echo -e "    поэтому баны CrowdSec на неё не влияют, в том числе при автопродлении."
+        echo -e "\n${GREEN}✅ С правилом ACCEPT проверка проходит — дропает цепочка INPUT.${NC}"
+        echo -e "    Значит какое-то правило стоит раньше разрешающего правила ufw."
+        echo -e "    Смотрите порядок: iptables -S INPUT  и  nft list ruleset | less"
+        echo -e "    Быстрый обход: сделать это правило постоянным —"
+        echo -e "      iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT  (и сохранить через netfilter-persistent)"
     else
-        echo -e "\n${YELLOW}[!] Без bouncer'а проверка тоже не проходит — дропает не CrowdSec.${NC}"
-        echo -e "    Ищите дальше: nft list ruleset | less  и  iptables -S | grep -v ufw"
-        echo -e "    Либо обойдите проблему: DNS-01 через Cloudflare (пункт 2)."
+        echo -e "\n${RED}[!] Даже с ACCEPT первым правилом ответа нет.${NC}"
+        echo -e "    Значит пакет теряется ДО цепочки INPUT. Остаются:"
+        echo -e "      • rp_filter при асимметричной маршрутизации (см. отчёт выше)"
+        echo -e "      • переполнение conntrack (см. отчёт выше)"
+        echo -e "      • перенаправление в nat/PREROUTING (см. отчёт выше)"
+        echo -e "      • фильтрация у хостера уже после того, как SYN дошёл до NIC"
+        echo -e "    Обход, который сработает в любом случае: DNS-01 через Cloudflare (пункт 2)."
     fi
 }
 
