@@ -444,7 +444,7 @@ install_node() {
     echo -e "${YELLOW}[*] Запуск внешнего скрипта установки...${NC}"
     bash <(curl -Ls https://raw.githubusercontent.com/nerioff1337/remnawave-node-auto/refs/heads/main/install.sh)
     echo -e "${GREEN}✅ Процесс установки завершен.${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 setup_hysteria2() {
@@ -462,7 +462,7 @@ setup_hysteria2() {
     safe_apt_install figlet
 
     if ! ensure_certbot; then
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
@@ -477,7 +477,7 @@ setup_hysteria2() {
         echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN...${NC}"
         if ! issue_certificate "$DOMAIN" "$NODE_PATH"; then
             echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN. Конфигурация ноды не изменена.${NC}"
-            read -p "Нажмите Enter, чтобы вернуться в меню..."
+            read -p "Нажмите Enter, чтобы вернуться в меню..." || true
             return
         fi
     fi
@@ -516,7 +516,7 @@ EOF
     docker compose -f "$COMPOSE_FILE" up -d
 
     echo -e "${GREEN}✅ Готово! Нода настроена для Hysteria2 (latest ветка).${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 update_xray_core() {
@@ -545,7 +545,7 @@ update_xray_core() {
         VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [ -z "$VER" ]; then
             echo -e "${RED}[!] Не удалось получить последнюю версию. Проверьте подключение.${NC}"
-            read -p "Нажмите Enter..."
+            read -p "Нажмите Enter..." || true
             return
         fi
     fi
@@ -583,7 +583,7 @@ EOF
     fi
 
     echo -e "${GREEN}✅ Ядро Xray успешно обновлено до $VER и применено.${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 restart_node() {
@@ -592,7 +592,7 @@ restart_node() {
     NODE_PATH=${NODE_PATH:-/opt/remnanode}
     docker compose -f "$NODE_PATH/docker-compose.yml" restart remnanode
     echo -e "${GREEN}✅ Нода перезапущена.${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 view_logs() {
@@ -607,22 +607,22 @@ renew_certs() {
     echo -e "\n${CYAN}=== Обновление сертификатов Let's Encrypt ===${NC}"
     if ! command -v certbot &> /dev/null; then
         echo -e "${RED}[!] Certbot не установлен. Пожалуйста, сначала выполните настройку (пункт 2).${NC}"
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
     if ! ensure_certbot; then
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
     if ! certbot renew --force-renewal; then
         echo -e "${RED}[!] Обновление сертификатов завершилось с ошибкой (см. вывод выше).${NC}"
         acme_failure_hints ""
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
     echo -e "${GREEN}✅ Процесс обновления завершен.${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 switch_branch() {
@@ -646,7 +646,7 @@ switch_branch() {
 
     if [ ! -f "$COMPOSE_FILE" ]; then
         echo -e "${RED}[!] Файл $COMPOSE_FILE не найден. Проверьте путь.${NC}"
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
@@ -669,7 +669,7 @@ switch_branch() {
             ;;
         *)
             echo -e "${RED}Неверный выбор.${NC}"
-            read -p "Нажмите Enter..."
+            read -p "Нажмите Enter..." || true
             return
             ;;
     esac
@@ -682,7 +682,7 @@ switch_branch() {
     docker compose -f "$COMPOSE_FILE" up -d
 
     echo -e "${GREEN}✅ Готово! Ветка успешно переключена.${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 # Разбор дампа: считаем ТОЛЬКО пакеты к нашему IP и от него.
@@ -735,6 +735,14 @@ run_acme_dry_run() {
         FW_BEFORE=""; FW_AFTER=""
     fi
 
+    NET_BEFORE=$(mktemp); NET_AFTER=$(mktemp)
+    snapshot_net_counters "$NET_BEFORE"
+
+    # Параллельно проверяем, что certbot действительно занял 80 порт
+    LISTEN_LOG=$(mktemp)
+    ( for _ in $(seq 1 40); do port_listener_info 80 >> "$LISTEN_LOG" 2>/dev/null; sleep 0.5; done ) &
+    LISTEN_PID=$!
+
     if command -v tcpdump >/dev/null 2>&1 && [ -n "$SERVER_IP" ]; then
         tcpd_log=$(mktemp)
         filter="host $SERVER_IP and tcp port 80"
@@ -763,6 +771,63 @@ run_acme_dry_run() {
     if [ -n "$FW_BEFORE" ]; then
         snapshot_fw_counters "$FW_AFTER"
     fi
+    snapshot_net_counters "$NET_AFTER"
+
+    if [ -n "$LISTEN_PID" ]; then
+        kill "$LISTEN_PID" >/dev/null 2>&1 || true
+        wait "$LISTEN_PID" 2>/dev/null || true
+    fi
+    LISTEN_SEEN=""
+    if [ -s "$LISTEN_LOG" ]; then
+        LISTEN_SEEN=$(sort -u "$LISTEN_LOG" | head -n 3)
+    fi
+    rm -f "$LISTEN_LOG"
+    return 0
+}
+
+# Счётчики сетевых ошибок ядра в виде "ИмяСчётчика значение"
+snapshot_net_counters() {
+    cat /proc/net/snmp /proc/net/netstat 2>/dev/null | awk '
+        {
+            proto = $1
+            if (!(proto in seen)) {
+                seen[proto] = 1
+                n = 0
+                for (i = 2; i <= NF; i++) nm[proto, ++n] = $i
+            } else {
+                base = substr(proto, 1, length(proto) - 1)
+                for (i = 2; i <= NF; i++) printf "%s%s %s\n", base, nm[proto, i - 1], $i
+                delete seen[proto]
+            }
+        }' > "$1" 2>/dev/null || : > "$1"
+}
+
+# Выросшие счётчики ошибок — только те, что объясняют молчаливый дроп
+report_counter_deltas() {
+    local before="$1" after="$2"
+    [ -s "$before" ] && [ -s "$after" ] || return 1
+    awk '
+        FNR == NR { prev[$1] = $2; next }
+        {
+            d = $2 - prev[$1]
+            if (d <= 0) next
+            if ($1 ~ /^(IpInAddrErrors|IpInHdrErrors|IpInDiscards|IpInUnknownProtos|TcpAttemptFails|TcpInErrs|TcpInCsumErrors|TcpExtListenOverflows|TcpExtListenDrops|TcpExtTCPBacklogDrop|TcpExtPAWSPassive|TcpExtPAWSActive|TcpExtPAWSEstab|TcpExtTCPReqQFullDrop|TcpExtTCPReqQFullDoCookies|IpExtInNoRoutes|IpExtInCsumErrors|IpExtInTruncatedPkts)$/)
+                printf "      +%d  %s\n", d, $1
+        }' "$before" "$after"
+}
+
+# Нативные nft-правила с вердиктом drop/reject (у них нет счётчиков в iptables-save)
+report_nft_drops() {
+    command -v nft >/dev/null 2>&1 || return 0
+    local hits
+    hits=$(nft list ruleset 2>/dev/null | grep -nE "^[[:space:]]*[^#]*[[:space:]](drop|reject)([[:space:]]|$)" | head -n 10)
+    if [ -n "$hits" ]; then
+        echo -e "${YELLOW}    [!] Нативные nft-правила с drop/reject (в iptables-save их не видно):${NC}"
+        echo "$hits" | sed 's/^/        /'
+    else
+        echo -e "${GREEN}    ✅ Нативных nft-правил с drop/reject нет.${NC}"
+    fi
+    return 0
 }
 
 # Обратное имя IP (для опознания валидаторов Let's Encrypt)
@@ -814,12 +879,12 @@ diagnose_acme() {
     read -p "Укажите доменное имя (например, node.domain.com): " DOMAIN
     if [ -z "$DOMAIN" ]; then
         echo -e "${RED}[!] Домен не указан.${NC}"
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
     if ! ensure_certbot; then
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
@@ -833,7 +898,7 @@ diagnose_acme() {
 
     if port_is_busy 80; then
         echo -e "${RED}[!] Порт 80/tcp занят — тест невозможен, сначала освободите порт.${NC}"
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
@@ -854,7 +919,7 @@ diagnose_acme() {
     if [ "$DRY_OK" = "1" ]; then
         echo -e "${GREEN}✅ Проверка HTTP-01 проходит. Можно выпускать боевой сертификат — пункт 2.${NC}"
         echo -e "${CYAN}==============================================${NC}"
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
@@ -862,7 +927,7 @@ diagnose_acme() {
         echo -e "${RED}[!] Проверка не прошла, но без tcpdump причину определить нельзя.${NC}"
         acme_failure_hints "$DOMAIN"
         echo -e "${CYAN}==============================================${NC}"
-        read -p "Нажмите Enter, чтобы вернуться в меню..."
+        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
         return
     fi
 
@@ -904,7 +969,7 @@ diagnose_acme() {
         echo -e "      • обход: DNS-01 через Cloudflare (пункт 2) — портов не требует"
     fi
     echo -e "${CYAN}==============================================${NC}"
-    read -p "Нажмите Enter, чтобы вернуться в меню..."
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
 # Сбор улик, когда SYN приходят, а SYN-ACK сервер не шлёт
@@ -1006,7 +1071,7 @@ report_drop_evidence() {
     fi
 
     # 4. Публичный IP реально на интерфейсе? Иначе ufw-not-local дропнет пакет
-    ip=$(detect_public_ip) || ip=""
+    ip=$(detect_public_ip 2>/dev/null) || ip=""
     if [ -n "$ip" ]; then
         if ip -4 addr show 2>/dev/null | grep -q "inet $ip/"; then
             echo -e "${GREEN}    ✅ Публичный IP $ip назначен на интерфейс.${NC}"
@@ -1034,10 +1099,36 @@ diagnose_local_drop() {
 
     report_drop_evidence
 
+    report_nft_drops
+
+    # Слушал ли certbot 80 порт на самом деле
+    if [ -n "$LISTEN_SEEN" ]; then
+        echo -e "${GREEN}    ✅ Во время проверки 80 порт был занят certbot:${NC}"
+        echo "$LISTEN_SEEN" | sed 's/^/        /'
+    else
+        echo -e "${RED}    [!] Во время проверки никто не слушал 80 порт — certbot не смог его занять.${NC}"
+        echo -e "${RED}        Тогда ответа и не могло быть: проблема не в файрволе.${NC}"
+    fi
+
+    # Счётчики ошибок ядра: молчаливые дропы до сокета
+    if [ -s "$NET_BEFORE" ] && [ -s "$NET_AFTER" ]; then
+        local deltas
+        deltas=$(report_counter_deltas "$NET_BEFORE" "$NET_AFTER" || true)
+        if [ -n "$deltas" ]; then
+            echo -e "${YELLOW}    [!] Ядро зафиксировало ошибки приёма во время проверки:${NC}"
+            echo "$deltas"
+            echo -e "${YELLOW}        Csum/PAWS/AddrErrors означают, что пакеты приходят битыми${NC}"
+            echo -e "${YELLOW}        или искажёнными по пути — это проблема сети провайдера.${NC}"
+        else
+            echo -e "${GREEN}    ✅ Ошибок приёма ядро не зафиксировало.${NC}"
+        fi
+    fi
+    rm -f "$NET_BEFORE" "$NET_AFTER"
+
     # Кто реально считал дропы во время проверки
     if [ -n "$FW_BEFORE" ] && [ -s "$FW_BEFORE" ] && [ -s "$FW_AFTER" ]; then
         local grown
-        grown=$(report_grown_drop_rules "$FW_BEFORE" "$FW_AFTER")
+        grown=$(report_grown_drop_rules "$FW_BEFORE" "$FW_AFTER" || true)
         echo -e "\n${CYAN}[*] Правила DROP/REJECT, сработавшие во время проверки:${NC}"
         if [ -n "$grown" ]; then
             echo "$grown"
@@ -1079,7 +1170,7 @@ diagnose_local_drop() {
                 echo -e "      • посмотреть баны: cscli decisions list -a"
                 echo -e "      • снять лишний бан: cscli decisions delete --ip <IP>"
                 echo -e "    Либо DNS-01 (пункт 2) — проверка не идёт по сети, баны на неё не влияют."
-                return
+                return 0
             fi
             echo -e "\n${YELLOW}[!] Без bouncer'а проверка тоже не проходит — дропает не CrowdSec.${NC}"
         fi
@@ -1092,7 +1183,7 @@ diagnose_local_drop() {
     echo -e "${YELLOW}    Это разделит два случая: дропает цепочка INPUT или что-то ДО неё${NC}"
     echo -e "${YELLOW}    (rp_filter, conntrack, NAT). Правило снимается сразу после теста.${NC}"
     read -p "Выполнить? (y/n): " answer
-    [[ "$answer" =~ ^[Yy]$ ]] || return
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
 
     trap 'echo -e "\n${YELLOW}[*] Прерывание: снимаю временное правило...${NC}"; iptables -D INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1; exit 130' INT
     echo -e "${YELLOW}[*] Добавляю временное правило...${NC}"
@@ -1126,6 +1217,7 @@ diagnose_local_drop() {
         echo -e "    несмотря на то что SYN виден в tcpdump. Это решается только тикетом в поддержку."
         echo -e "    Рабочий обход прямо сейчас: DNS-01 через Cloudflare (пункт 2)."
     fi
+    return 0
 }
 
 while true; do
