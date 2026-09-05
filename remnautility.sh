@@ -728,6 +728,13 @@ run_acme_dry_run() {
 
     SERVER_IP=$(detect_public_ip) || SERVER_IP=""
 
+    if command -v iptables-save >/dev/null 2>&1; then
+        FW_BEFORE=$(mktemp); FW_AFTER=$(mktemp)
+        snapshot_fw_counters "$FW_BEFORE"
+    else
+        FW_BEFORE=""; FW_AFTER=""
+    fi
+
     if command -v tcpdump >/dev/null 2>&1 && [ -n "$SERVER_IP" ]; then
         tcpd_log=$(mktemp)
         filter="host $SERVER_IP and tcp port 80"
@@ -752,6 +759,47 @@ run_acme_dry_run() {
         analyze_capture "$tcpd_log" "$SERVER_IP"
         rm -f "$tcpd_log"
     fi
+
+    if [ -n "$FW_BEFORE" ]; then
+        snapshot_fw_counters "$FW_AFTER"
+    fi
+}
+
+# Обратное имя IP (для опознания валидаторов Let's Encrypt)
+ptr_of_ip() {
+    if command -v dig >/dev/null 2>&1; then
+        dig +short -x "$1" 2>/dev/null | head -n 1
+    else
+        getent hosts "$1" 2>/dev/null | awk '{print $2; exit}'
+    fi
+}
+
+# Счётчики пакетов по всем правилам iptables (все таблицы)
+snapshot_fw_counters() {
+    iptables-save -c >"$1" 2>/dev/null || : >"$1"
+}
+
+# Правила DROP/REJECT, счётчик которых вырос между снимками
+report_grown_drop_rules() {
+    local before="$1" after="$2"
+    [ -s "$before" ] && [ -s "$after" ] || return 1
+    awk '
+        FNR == NR {
+            if ($1 ~ /^\[[0-9]+:[0-9]+\]$/) {
+                c = $1; sub(/^\[/, "", c); sub(/:.*/, "", c)
+                r = $0; sub(/^\[[0-9]+:[0-9]+\] /, "", r)
+                prev[r] = c
+            }
+            next
+        }
+        {
+            if ($1 ~ /^\[[0-9]+:[0-9]+\]$/) {
+                c = $1; sub(/^\[/, "", c); sub(/:.*/, "", c)
+                r = $0; sub(/^\[[0-9]+:[0-9]+\] /, "", r)
+                d = c - prev[r]
+                if (d > 0 && r ~ /-j (DROP|REJECT)/) printf "      +%d пакетов: %s\n", d, r
+            }
+        }' "$before" "$after"
 }
 
 # Есть ли активный crowdsec-firewall-bouncer
@@ -820,9 +868,17 @@ diagnose_acme() {
 
     echo -e "${CYAN}[*] Пакеты на $SERVER_IP:80 — входящих SYN: $SYN_IN, ответов SYN-ACK: $SYNACK_OUT.${NC}"
     if [ -n "$SYN_SOURCES" ]; then
-        echo -e "${CYAN}    Кто стучался: $SYN_SOURCES${NC}"
-        echo -e "${CYAN}    (проверка Let's Encrypt идёт с нескольких разных IP из разных стран;${NC}"
-        echo -e "${CYAN}     одиночные адреса — обычно сканеры, а не валидаторы)${NC}"
+        echo -e "${CYAN}    Кто стучался:${NC}"
+        local src host_name label
+        for src in $SYN_SOURCES; do
+            host_name=$(ptr_of_ip "${src%%(*}")
+            case "$host_name" in
+                *letsencrypt*) label="${GREEN}валидатор Let's Encrypt${NC}" ;;
+                "")            label="обратной записи нет — вероятно сканер" ;;
+                *)             label="$host_name" ;;
+            esac
+            echo -e "      $src — $label"
+        done
     fi
     echo
 
@@ -906,6 +962,49 @@ report_drop_evidence() {
         esac
     fi
 
+    # 3b. Что стоит ДО цепочки INPUT: таблицы raw/mangle, nft-хуки, XDP/tc
+    if iptables -t raw -S 2>/dev/null | grep -qE -- "-j (DROP|REJECT)"; then
+        echo -e "${RED}    [!] В таблице raw есть DROP/REJECT — это срабатывает раньше INPUT:${NC}"
+        iptables -t raw -S 2>/dev/null | grep -E -- "-j (DROP|REJECT)" | head -n 5 | sed 's/^/        /'
+    else
+        echo -e "${GREEN}    ✅ В таблице raw блокирующих правил нет.${NC}"
+    fi
+    if iptables -t mangle -S 2>/dev/null | grep -qE -- "-j (DROP|REJECT)"; then
+        echo -e "${RED}    [!] В таблице mangle есть DROP/REJECT:${NC}"
+        iptables -t mangle -S 2>/dev/null | grep -E -- "-j (DROP|REJECT)" | head -n 5 | sed 's/^/        /'
+    else
+        echo -e "${GREEN}    ✅ В таблице mangle блокирующих правил нет.${NC}"
+    fi
+    if nft list ruleset 2>/dev/null | grep -qE "hook (prerouting|ingress)"; then
+        echo -e "${YELLOW}    [!] Есть nft-цепочки с хуком prerouting/ingress — они работают до INPUT:${NC}"
+        nft list ruleset 2>/dev/null | grep -B2 -E "hook (prerouting|ingress)" | head -n 12 | sed 's/^/        /'
+    else
+        echo -e "${GREEN}    ✅ nft-цепочек с хуком prerouting/ingress нет.${NC}"
+    fi
+    if [ -n "$iface" ]; then
+        if ip link show "$iface" 2>/dev/null | grep -q "xdp"; then
+            echo -e "${RED}    [!] На $iface подключена XDP-программа — она отбрасывает пакеты${NC}"
+            echo -e "${RED}        раньше вообще всего, включая iptables.${NC}"
+        elif tc filter show dev "$iface" ingress 2>/dev/null | grep -q .; then
+            echo -e "${YELLOW}    [!] На $iface есть ingress-фильтры tc:${NC}"
+            tc filter show dev "$iface" ingress 2>/dev/null | head -n 5 | sed 's/^/        /'
+        else
+            echo -e "${GREEN}    ✅ XDP/tc-фильтров на $iface нет.${NC}"
+        fi
+    fi
+
+    # 3c. Куда пойдёт ответ валидатору (важно при policy routing и rp_filter)
+    if [ -n "$SYN_SOURCES" ]; then
+        local first_src route_back
+        first_src=$(echo "$SYN_SOURCES" | awk '{print $1}')
+        first_src="${first_src%%(*}"
+        route_back=$(ip route get "$first_src" 2>/dev/null | head -n 1)
+        if [ -n "$route_back" ]; then
+            echo -e "${CYAN}    Обратный маршрут к $first_src:${NC}"
+            echo "        $route_back"
+        fi
+    fi
+
     # 4. Публичный IP реально на интерфейсе? Иначе ufw-not-local дропнет пакет
     ip=$(detect_public_ip) || ip=""
     if [ -n "$ip" ]; then
@@ -934,6 +1033,22 @@ diagnose_local_drop() {
     fi
 
     report_drop_evidence
+
+    # Кто реально считал дропы во время проверки
+    if [ -n "$FW_BEFORE" ] && [ -s "$FW_BEFORE" ] && [ -s "$FW_AFTER" ]; then
+        local grown
+        grown=$(report_grown_drop_rules "$FW_BEFORE" "$FW_AFTER")
+        echo -e "\n${CYAN}[*] Правила DROP/REJECT, сработавшие во время проверки:${NC}"
+        if [ -n "$grown" ]; then
+            echo "$grown"
+            echo -e "${YELLOW}    Смотрите правила выше — трафик считается именно ими.${NC}"
+            echo -e "${YELLOW}    (часть срабатываний может относиться к постороннему трафику)${NC}"
+        else
+            echo -e "${GREEN}    Ни одно правило iptables не сработало — значит дропает не iptables.${NC}"
+            echo -e "${YELLOW}    Остаются: nft-хуки prerouting/ingress, XDP/tc или фильтр хостера,${NC}"
+            echo -e "${YELLOW}    стоящий уже после того, как пакет отразился в tcpdump.${NC}"
+        fi
+    fi
 
     # Решающий тест 1: CrowdSec (только если bouncer реально работает)
     if crowdsec_bouncer_active; then
@@ -1002,12 +1117,14 @@ diagnose_local_drop() {
         echo -e "      iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT  (и сохранить через netfilter-persistent)"
     else
         echo -e "\n${RED}[!] Даже с ACCEPT первым правилом ответа нет.${NC}"
-        echo -e "    Значит пакет теряется ДО цепочки INPUT. Остаются:"
-        echo -e "      • rp_filter при асимметричной маршрутизации (см. отчёт выше)"
-        echo -e "      • переполнение conntrack (см. отчёт выше)"
-        echo -e "      • перенаправление в nat/PREROUTING (см. отчёт выше)"
-        echo -e "      • фильтрация у хостера уже после того, как SYN дошёл до NIC"
-        echo -e "    Обход, который сработает в любом случае: DNS-01 через Cloudflare (пункт 2)."
+        echo -e "    Пакет теряется ДО цепочки INPUT. Сверьтесь с отчётом выше:"
+        echo -e "      • сработавшие правила DROP/REJECT (если их нет — дело не в iptables)"
+        echo -e "      • таблицы raw/mangle и nft-хуки prerouting/ingress"
+        echo -e "      • XDP/tc-программы на интерфейсе"
+        echo -e "      • rp_filter и обратный маршрут к валидатору"
+        echo -e "    Если всё чисто — фильтрует хостер уже на своей стороне,"
+        echo -e "    несмотря на то что SYN виден в tcpdump. Это решается только тикетом в поддержку."
+        echo -e "    Рабочий обход прямо сейчас: DNS-01 через Cloudflare (пункт 2)."
     fi
 }
 
