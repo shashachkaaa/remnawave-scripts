@@ -319,9 +319,83 @@ acme_failure_hints() {
     echo -e "${YELLOW}    Точный ответ, где именно теряется трафик, даёт пункт меню 8 (диагностика).${NC}"
 }
 
-# Выпуск сертификата с фолбэком на TLS-ALPN-01 (443/tcp), если 80 закрыт
+# --- DNS-01 через Cloudflare (порты не нужны вообще) -----------------------
+
+CF_CREDS="/etc/letsencrypt/cloudflare.ini"
+
+# certbot стоит в изолированном venv?
+certbot_is_venv() {
+    [ -x /opt/certbot-venv/bin/certbot ] || return 1
+    [ "$(readlink -f "$(command -v certbot)" 2>/dev/null)" = "/opt/certbot-venv/bin/certbot" ]
+}
+
+ensure_dns_cloudflare_plugin() {
+    if certbot plugins --non-interactive 2>/dev/null | grep -q "dns-cloudflare"; then
+        return 0
+    fi
+    echo -e "${YELLOW}[*] Устанавливаю плагин certbot для Cloudflare...${NC}"
+    set +e
+    if certbot_is_venv; then
+        /opt/certbot-venv/bin/pip install -q certbot-dns-cloudflare >/dev/null 2>&1
+    else
+        apt-get install -y -qq python3-certbot-dns-cloudflare >/dev/null 2>&1
+    fi
+    set -e
+    if certbot plugins --non-interactive 2>/dev/null | grep -q "dns-cloudflare"; then
+        return 0
+    fi
+    echo -e "${RED}[!] Плагин dns-cloudflare установить не удалось.${NC}"
+    return 1
+}
+
+# Запрос и сохранение API-токена Cloudflare (в файл с правами 600)
+setup_cloudflare_credentials() {
+    local token answer
+    if [ -f "$CF_CREDS" ]; then
+        echo -e "${GREEN}[*] Найден сохранённый токен Cloudflare ($CF_CREDS).${NC}"
+        read -p "Использовать его? (y/n): " answer
+        [[ "$answer" =~ ^[Yy]$ ]] && return 0
+    fi
+
+    echo -e "${CYAN}[*] Нужен API-токен Cloudflare с правом Zone:DNS:Edit для вашей зоны.${NC}"
+    echo -e "${CYAN}    Создать: https://dash.cloudflare.com/profile/api-tokens${NC}"
+    echo -e "${CYAN}    -> Create Token -> шаблон 'Edit zone DNS' -> выбрать нужную зону${NC}"
+    read -rsp "Вставьте API-токен (ввод скрыт): " token
+    echo
+    if [ -z "$token" ]; then
+        echo -e "${RED}[!] Токен не введён.${NC}"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$CF_CREDS")"
+    ( umask 077; printf 'dns_cloudflare_api_token = %s\n' "$token" > "$CF_CREDS" )
+    chmod 600 "$CF_CREDS"
+    unset token
+    echo -e "${GREEN}[*] Токен сохранён в $CF_CREDS (чтение только для root).${NC}"
+    return 0
+}
+
+issue_certificate_dns_cloudflare() {
+    local domain="$1" hook="$2"
+
+    ensure_dns_cloudflare_plugin || return 1
+    setup_cloudflare_credentials || return 1
+
+    echo -e "${GREEN}[*] Выпуск через DNS-01 (Cloudflare). Ждём распространения TXT-записи...${NC}"
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDS" \
+        --dns-cloudflare-propagation-seconds 30 -d "$domain" \
+        --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "$hook"
+}
+
+# NS домена похожи на Cloudflare?
+domain_uses_cloudflare() {
+    command -v dig >/dev/null 2>&1 || return 1
+    dig +short NS "$1" 2>/dev/null | grep -qi cloudflare
+}
+
+# Выпуск сертификата: HTTP-01, а при неудаче — DNS-01 или TLS-ALPN-01
 issue_certificate() {
-    local domain="$1" node_path="$2" answer
+    local domain="$1" node_path="$2" answer cf_hint=""
     local hook="docker compose -f $node_path/docker-compose.yml restart remnanode"
 
     if certbot certonly --standalone -d "$domain" --non-interactive --agree-tos \
@@ -332,20 +406,37 @@ issue_certificate() {
     echo -e "${RED}[!] Проверка по HTTP-01 (порт 80/tcp) не прошла.${NC}"
     acme_failure_hints "$domain"
 
+    domain_uses_cloudflare "$domain" && cf_hint=" — у вашего домена обнаружены NS Cloudflare"
+
+    echo -e "\n${CYAN}Альтернативные способы выпуска:${NC}"
+    echo -e "  ${YELLOW}1.${NC} DNS-01 через Cloudflare — открытые порты не нужны вообще${cf_hint}"
     if port_is_busy 443; then
-        echo -e "${YELLOW}[*] TCP/443 занят, альтернативная проверка TLS-ALPN-01 недоступна:${NC}"
-        port_listener_info 443
-        return 1
+        echo -e "  ${YELLOW}2.${NC} TLS-ALPN-01 по 443/tcp — ${RED}недоступно, порт занят:${NC}"
+        port_listener_info 443 | sed 's/^/       /'
+    else
+        echo -e "  ${YELLOW}2.${NC} TLS-ALPN-01 по 443/tcp (порт свободен)"
     fi
+    echo -e "  ${YELLOW}0.${NC} Отмена"
+    read -p "Выберите способ (0-2): " answer
 
-    echo -e "\n${YELLOW}[*] Если у хостера закрыт только 80 порт, можно пройти проверку по 443/tcp.${NC}"
-    echo -e "${YELLOW}    Важно: 443/tcp должен оставаться открытым и для автопродления.${NC}"
-    read -p "Попробовать альтернативный способ TLS-ALPN-01 (443/tcp)? (y/n): " answer
-    [[ "$answer" =~ ^[Yy]$ ]] || return 1
-
-    echo -e "${GREEN}[*] Повторный выпуск через TLS-ALPN-01...${NC}"
-    certbot certonly --standalone --preferred-challenges tls-alpn-01 -d "$domain" \
-        --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "$hook"
+    case "$answer" in
+        1)
+            issue_certificate_dns_cloudflare "$domain" "$hook"
+            ;;
+        2)
+            if port_is_busy 443; then
+                echo -e "${RED}[!] Порт 443/tcp занят — этот способ работать не будет.${NC}"
+                return 1
+            fi
+            echo -e "${YELLOW}    Важно: 443/tcp должен оставаться свободным и для автопродления.${NC}"
+            echo -e "${GREEN}[*] Повторный выпуск через TLS-ALPN-01...${NC}"
+            certbot certonly --standalone --preferred-challenges tls-alpn-01 -d "$domain" \
+                --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "$hook"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 install_node() {
@@ -680,8 +771,8 @@ diagnose_acme() {
         echo -e "${RED}    Локальный файрвол ни при чём: блокирует хостер или аплинк.${NC}"
         echo -e "    Варианты:"
         echo -e "      • открыть входящий 80/tcp в панели хостера / security group"
-        echo -e "      • выпустить сертификат через TLS-ALPN-01 по 443/tcp (пункт 2 предложит сам)"
-        echo -e "      • перейти на проверку DNS-01 (нужен API-токен DNS-провайдера)"
+        echo -e "      • DNS-01 через Cloudflare — порты не нужны вообще (пункт 2 предложит сам)"
+        echo -e "      • TLS-ALPN-01 по 443/tcp, если этот порт свободен"
     fi
     echo -e "${CYAN}==============================================${NC}"
     read -p "Нажмите Enter, чтобы вернуться в меню..."
