@@ -1102,6 +1102,70 @@ report_drop_evidence() {
     fi
 }
 
+# Считающее правило в самом раннем хуке netfilter (raw/PREROUTING).
+# Отвечает на вопрос: попадают ли пакеты в сетевой стек вообще, или их
+# видит только tcpdump (то есть они отбрасываются ещё до стека).
+RAW_COUNTER_SPEC="-p tcp -m tcp --dport 80"
+
+read_raw_counter() {
+    iptables-save -c -t raw 2>/dev/null \
+        | grep -E "^\[[0-9]+:[0-9]+\] -A PREROUTING $RAW_COUNTER_SPEC$" \
+        | head -n 1 | sed -E 's/^\[([0-9]+):.*/\1/'
+}
+
+test_netfilter_visibility() {
+    local domain="$1" answer before after
+    command -v iptables-save >/dev/null 2>&1 || return 0
+
+    echo -e "\n${YELLOW}[*] Решающий тест: поставить считающее правило в самый ранний хук${NC}"
+    echo -e "${YELLOW}    netfilter (raw/PREROUTING). Оно ничего не блокирует — только считает.${NC}"
+    echo -e "${YELLOW}    Если счётчик останется нулевым, значит пакеты видит только tcpdump,${NC}"
+    echo -e "${YELLOW}    а в сетевой стек сервера они не попадают вообще.${NC}"
+    read -p "Выполнить? (y/n): " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+
+    trap 'echo -e "\n${YELLOW}[*] Прерывание: снимаю считающее правило...${NC}"; iptables -t raw -D PREROUTING $RAW_COUNTER_SPEC >/dev/null 2>&1; exit 130' INT
+    iptables -t raw -I PREROUTING 1 $RAW_COUNTER_SPEC
+    before=$(read_raw_counter); before=${before:-0}
+
+    run_acme_dry_run "$domain"
+
+    after=$(read_raw_counter); after=${after:-0}
+    iptables -t raw -D PREROUTING $RAW_COUNTER_SPEC >/dev/null 2>&1 || true
+    trap - INT
+
+    local seen=$(( after - before ))
+    echo -e "\n${CYAN}[*] Пакетов на 80/tcp увидел netfilter: $seen (tcpdump за то же время: $SYN_IN)${NC}"
+
+    if [ "$seen" -gt 0 ]; then
+        echo -e "${YELLOW}[!] Пакеты доходят до netfilter — значит стек их получает.${NC}"
+        echo -e "    Ищите правило, которое их роняет дальше: nft list ruleset | less"
+        return 0
+    fi
+
+    if [ "$SYN_IN" -gt 0 ]; then
+        echo -e "\n${RED}================================================================${NC}"
+        echo -e "${RED}  ВЕРДИКТ: пакеты видит только tcpdump, в сетевой стек они не попадают.${NC}"
+        echo -e "${RED}================================================================${NC}"
+        echo -e "    Сервер физически не может на них ответить, и никакая настройка"
+        echo -e "    файрвола этого не изменит — фильтрация происходит вне вашей ОС"
+        echo -e "    (гипервизор или сеть хостера)."
+        echo -e "\n${CYAN}    Текст для тикета в поддержку хостера:${NC}"
+        echo -e "${CYAN}    ------------------------------------------------------------${NC}"
+        echo -e "    Входящие TCP-соединения на порт 80 не работают."
+        echo -e "    SYN-пакеты от $SYN_SOURCES видны в tcpdump на интерфейсе,"
+        echo -e "    но не доходят до сетевого стека: считающее правило в"
+        echo -e "    iptables raw/PREROUTING показывает 0 пакетов."
+        echo -e "    На сервере: ufw разрешает 80/tcp, блокирующих правил нет,"
+        echo -e "    порт слушает процесс, conntrack не переполнен."
+        echo -e "    Прошу проверить фильтрацию входящего 80/tcp на вашей стороне."
+        echo -e "${CYAN}    ------------------------------------------------------------${NC}"
+        echo -e "\n${GREEN}    Пока идёт разбирательство: пункт 2 -> вариант 1 (DNS-01 через${NC}"
+        echo -e "${GREEN}    Cloudflare) выпустит сертификат вообще без открытых портов.${NC}"
+    fi
+    return 0
+}
+
 # SYN приходят, ответа нет: ищем, кто именно дропает
 diagnose_local_drop() {
     local domain="$1" answer
@@ -1163,8 +1227,9 @@ diagnose_local_drop() {
             echo -e "${YELLOW}    (часть срабатываний может относиться к постороннему трафику)${NC}"
         else
             echo -e "${GREEN}    Ни одно правило iptables не сработало — значит дропает не iptables.${NC}"
-            echo -e "${YELLOW}    Остаются: nft-хуки prerouting/ingress, XDP/tc или фильтр хостера,${NC}"
-            echo -e "${YELLOW}    стоящий уже после того, как пакет отразился в tcpdump.${NC}"
+            echo -e "${YELLOW}    Проверьте счётчики у nft-правил выше: если у всех packets 0,${NC}"
+            echo -e "${YELLOW}    то и nft ни при чём — тогда следующий тест покажет, доходят ли${NC}"
+            echo -e "${YELLOW}    пакеты до сетевого стека вообще.${NC}"
         fi
     fi
 
@@ -1205,7 +1270,10 @@ diagnose_local_drop() {
         echo -e "\n${CYAN}[*] crowdsec-firewall-bouncer не запущен — значит дело не в нём.${NC}"
     fi
 
-    # Решающий тест 2: правило ACCEPT в самом начале INPUT
+    # Решающий тест 2: видит ли пакеты netfilter вообще
+    test_netfilter_visibility "$domain"
+
+    # Решающий тест 3: правило ACCEPT в самом начале INPUT
     echo -e "\n${YELLOW}[*] Решающий тест: временно поставить ACCEPT для 80/tcp первым правилом INPUT.${NC}"
     echo -e "${YELLOW}    Это разделит два случая: дропает цепочка INPUT или что-то ДО неё${NC}"
     echo -e "${YELLOW}    (rp_filter, conntrack, NAT). Правило снимается сразу после теста.${NC}"
