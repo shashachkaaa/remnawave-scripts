@@ -689,35 +689,41 @@ switch_branch() {
 # Без этого в счётчик попадают исходящие соединения сервера к чужим 80 портам.
 analyze_capture() {
     local log="$1" ip="$2" out
-    SYN_IN=0; SYNACK_OUT=0; SYN_SOURCES=""
+    SYN_IN=0; SYNACK_OUT=0; RST_OUT=0; OTHER_OUT=0; SYN_SOURCES=""; CAPTURE_EXCERPT=""
     [ -s "$log" ] || return 0
 
     out=$(awk -v ip="$ip" '
         {
-            src=""; dst=""
+            src = ""; dst = ""
             for (i = 2; i < NF; i++) {
                 if ($i == ">") { src = $(i-1); dst = $(i+1); break }
             }
             if (src == "" || dst == "") next
             sub(/:$/, "", dst)
-            if ($0 ~ /Flags \[S\],/ && dst == ip ".80") {
-                sub(/\.[0-9]+$/, "", src)
-                n_in++; seen[src]++
-            } else if ($0 ~ /Flags \[S\.\]/ && src == ip ".80") {
-                n_out++
+            if (dst == ip ".80" && $0 ~ /Flags \[S\],/) {
+                s = src; sub(/\.[0-9]+$/, "", s)
+                n_in++; seen[s]++
+            } else if (src == ip ".80") {
+                if ($0 ~ /Flags \[S\.\]/) n_synack++
+                else if ($0 ~ /Flags \[R/) n_rst++
+                else n_other++
             }
         }
         END {
-            printf "%d %d", n_in + 0, n_out + 0
+            printf "%d %d %d %d", n_in + 0, n_synack + 0, n_rst + 0, n_other + 0
             for (h in seen) printf " %s(%d)", h, seen[h]
             printf "\n"
         }' "$log")
 
     SYN_IN=$(echo "$out" | awk '{print $1}')
     SYNACK_OUT=$(echo "$out" | awk '{print $2}')
-    SYN_SOURCES=$(echo "$out" | cut -d' ' -f3-)
-    SYN_IN=${SYN_IN:-0}
-    SYNACK_OUT=${SYNACK_OUT:-0}
+    RST_OUT=$(echo "$out" | awk '{print $3}')
+    OTHER_OUT=$(echo "$out" | awk '{print $4}')
+    SYN_SOURCES=$(echo "$out" | cut -d' ' -f5-)
+    SYN_IN=${SYN_IN:-0}; SYNACK_OUT=${SYNACK_OUT:-0}
+    RST_OUT=${RST_OUT:-0}; OTHER_OUT=${OTHER_OUT:-0}
+    CAPTURE_EXCERPT=$(grep -F "$ip.80" "$log" 2>/dev/null | head -n 8 || true)
+    return 0
 }
 
 # Прогон пробной проверки с захватом трафика на 80/tcp.
@@ -947,6 +953,20 @@ diagnose_acme() {
     fi
     echo
 
+    if [ "$RST_OUT" -gt 0 ]; then
+        echo -e "${YELLOW}    Сервер ответил RST ($RST_OUT шт.) — порт отвергает соединение,${NC}"
+        echo -e "${YELLOW}    но до Let's Encrypt этот ответ не дошёл (иначе была бы ошибка${NC}"
+        echo -e "${YELLOW}    'Connection refused', а не таймаут).${NC}"
+    fi
+    if [ "$OTHER_OUT" -gt 0 ]; then
+        echo -e "${CYAN}    Прочих исходящих пакетов с порта 80: $OTHER_OUT${NC}"
+    fi
+    if [ -n "$CAPTURE_EXCERPT" ]; then
+        echo -e "${CYAN}    Выдержка из дампа:${NC}"
+        echo "$CAPTURE_EXCERPT" | sed 's/^/      /'
+    fi
+    echo
+
     if [ "$SYN_IN" -eq 0 ]; then
         echo -e "${RED}[!] Ни одного входящего SYN на $SERVER_IP:80 — трафик режется ДО сервера.${NC}"
         echo -e "${RED}    Локальный файрвол ни при чём: блокирует хостер или аплинк.${NC}"
@@ -955,8 +975,8 @@ diagnose_acme() {
         echo -e "      • или выпустить сертификат через DNS-01 (пункт 2 предложит сам)"
 
     elif [ "$SYNACK_OUT" -eq 0 ]; then
-        echo -e "${YELLOW}[!] SYN приходят, но сервер не отвечает ни одним SYN-ACK.${NC}"
-        echo -e "${YELLOW}    Пакеты дропает netfilter на самом сервере — раньше, чем правила ufw.${NC}"
+        echo -e "${YELLOW}[!] SYN приходят, но сервер не отвечает установкой соединения.${NC}"
+        echo -e "${YELLOW}    Ищем, теряется пакет на сервере или не доходит до его сетевого стека.${NC}"
         diagnose_local_drop "$DOMAIN"
 
     else
@@ -1101,10 +1121,17 @@ diagnose_local_drop() {
 
     report_nft_drops
 
-    # Слушал ли certbot 80 порт на самом деле
+    # Слушал ли certbot 80 порт на самом деле и на каком семействе адресов
     if [ -n "$LISTEN_SEEN" ]; then
         echo -e "${GREEN}    ✅ Во время проверки 80 порт был занят certbot:${NC}"
         echo "$LISTEN_SEEN" | sed 's/^/        /'
+        local v6only
+        v6only=$(sysctl -n net.ipv6.bindv6only 2>/dev/null || echo 0)
+        if echo "$LISTEN_SEEN" | grep -qE "(\*|\[::\]):80" && [ "$v6only" = "1" ]; then
+            echo -e "${RED}    [!] Сокет открыт только на IPv6 (*:80), а net.ipv6.bindv6only=1 —${NC}"
+            echo -e "${RED}        IPv4-подключения такой сокет не принимает. Лечится:${NC}"
+            echo -e "${RED}        sysctl -w net.ipv6.bindv6only=0${NC}"
+        fi
     else
         echo -e "${RED}    [!] Во время проверки никто не слушал 80 порт — certbot не смог его занять.${NC}"
         echo -e "${RED}        Тогда ответа и не могло быть: проблема не в файрволе.${NC}"
