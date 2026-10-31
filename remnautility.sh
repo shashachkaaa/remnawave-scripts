@@ -231,32 +231,33 @@ resolve_domain_ip() {
     fi
 }
 
-# Открыть 80/tcp в управляемом файрволе (ufw / firewalld) — с подтверждением
-firewall_allow_http() {
-    local answer
+# Открыть порт $1/tcp в управляемом файрволе (ufw / firewalld) — с подтверждением.
+# $2 — зачем нужен порт (для пояснения пользователю)
+firewall_allow_port() {
+    local port="$1" why="$2" answer
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]]+ALLOW'; then
-            echo -e "${GREEN}[*] ufw активен, 80/tcp уже разрешён.${NC}"
+        if ufw status 2>/dev/null | grep -qE "^${port}(/tcp)?[[:space:]]+ALLOW"; then
+            echo -e "${GREEN}[*] ufw активен, ${port}/tcp уже разрешён.${NC}"
         else
-            echo -e "${YELLOW}[!] ufw активен, но правила для 80/tcp нет — Let's Encrypt не достучится.${NC}"
-            read -p "Открыть 80/tcp в ufw (нужно и для автопродления)? (y/n): " answer
+            echo -e "${YELLOW}[!] ufw активен, но правила для ${port}/tcp нет — ${why}.${NC}"
+            read -p "Открыть ${port}/tcp в ufw? (y/n): " answer
             if [[ "$answer" =~ ^[Yy]$ ]]; then
-                ufw allow 80/tcp >/dev/null 2>&1 && echo -e "${GREEN}[*] ufw: 80/tcp открыт.${NC}"
+                ufw allow "${port}/tcp" >/dev/null 2>&1 && echo -e "${GREEN}[*] ufw: ${port}/tcp открыт.${NC}"
             fi
         fi
         return 0
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        if firewall-cmd --query-port=80/tcp >/dev/null 2>&1; then
-            echo -e "${GREEN}[*] firewalld активен, 80/tcp уже разрешён.${NC}"
+        if firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+            echo -e "${GREEN}[*] firewalld активен, ${port}/tcp уже разрешён.${NC}"
         else
-            echo -e "${YELLOW}[!] firewalld активен, 80/tcp закрыт.${NC}"
-            read -p "Открыть 80/tcp в firewalld? (y/n): " answer
+            echo -e "${YELLOW}[!] firewalld активен, ${port}/tcp закрыт — ${why}.${NC}"
+            read -p "Открыть ${port}/tcp в firewalld? (y/n): " answer
             if [[ "$answer" =~ ^[Yy]$ ]]; then
-                firewall-cmd --permanent --add-port=80/tcp >/dev/null 2>&1
+                firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
                 firewall-cmd --reload >/dev/null 2>&1
-                echo -e "${GREEN}[*] firewalld: 80/tcp открыт.${NC}"
+                echo -e "${GREEN}[*] firewalld: ${port}/tcp открыт.${NC}"
             fi
         fi
         return 0
@@ -264,12 +265,17 @@ firewall_allow_http() {
 
     # Голый iptables/nftables не трогаем автоматически — только предупреждаем
     if iptables -S INPUT 2>/dev/null | head -n 1 | grep -q -- "-P INPUT DROP"; then
-        if ! iptables -S INPUT 2>/dev/null | grep -qE -- "--dport 80 .*-j (ACCEPT|RETURN)"; then
-            echo -e "${YELLOW}[!] Политика iptables INPUT = DROP, явного правила для 80/tcp нет.${NC}"
-            echo -e "${YELLOW}    Откройте порт вручную: iptables -I INPUT -p tcp --dport 80 -j ACCEPT${NC}"
+        if ! iptables -S INPUT 2>/dev/null | grep -qE -- "--dport ${port} .*-j (ACCEPT|RETURN)"; then
+            echo -e "${YELLOW}[!] Политика iptables INPUT = DROP, явного правила для ${port}/tcp нет.${NC}"
+            echo -e "${YELLOW}    Откройте порт вручную: iptables -I INPUT -p tcp --dport ${port} -j ACCEPT${NC}"
         fi
     fi
     return 0
+}
+
+# Открыть 80/tcp — без него Let's Encrypt не достучится (HTTP-01)
+firewall_allow_http() {
+    firewall_allow_port 80 "Let's Encrypt не достучится (порт нужен и для автопродления)"
 }
 
 # Проверки перед выпуском сертификата
@@ -377,14 +383,16 @@ setup_cloudflare_credentials() {
 
 issue_certificate_dns_cloudflare() {
     local domain="$1" hook="$2"
+    local hook_args=()
+    if [ -n "$hook" ]; then hook_args=(--deploy-hook "$hook"); fi
 
     ensure_dns_cloudflare_plugin || return 1
     setup_cloudflare_credentials || return 1
 
     echo -e "${GREEN}[*] Выпуск через DNS-01 (Cloudflare). Ждём распространения TXT-записи...${NC}"
     certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CF_CREDS" \
-        --dns-cloudflare-propagation-seconds 30 -d "$domain" \
-        --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "$hook"
+        --dns-cloudflare-propagation-seconds 30 -d "$domain" --cert-name "$domain" \
+        --non-interactive --agree-tos --register-unsafely-without-email "${hook_args[@]}"
 }
 
 # NS домена похожи на Cloudflare?
@@ -393,13 +401,16 @@ domain_uses_cloudflare() {
     dig +short NS "$1" 2>/dev/null | grep -qi cloudflare
 }
 
-# Выпуск сертификата: HTTP-01, а при неудаче — DNS-01 или TLS-ALPN-01
+# Выпуск сертификата: HTTP-01, а при неудаче — DNS-01 или TLS-ALPN-01.
+# $2 — deploy-hook (команда после выпуска/продления), может быть пустым.
+# Сертификат всегда ложится в /etc/letsencrypt/live/<домен>/
 issue_certificate() {
-    local domain="$1" node_path="$2" answer cf_hint=""
-    local hook="docker compose -f $node_path/docker-compose.yml restart remnanode"
+    local domain="$1" hook="$2" answer cf_hint=""
+    local hook_args=()
+    if [ -n "$hook" ]; then hook_args=(--deploy-hook "$hook"); fi
 
-    if certbot certonly --standalone -d "$domain" --non-interactive --agree-tos \
-        --register-unsafely-without-email --deploy-hook "$hook"; then
+    if certbot certonly --standalone -d "$domain" --cert-name "$domain" --non-interactive --agree-tos \
+        --register-unsafely-without-email "${hook_args[@]}"; then
         return 0
     fi
 
@@ -430,8 +441,8 @@ issue_certificate() {
             fi
             echo -e "${YELLOW}    Важно: 443/tcp должен оставаться свободным и для автопродления.${NC}"
             echo -e "${GREEN}[*] Повторный выпуск через TLS-ALPN-01...${NC}"
-            certbot certonly --standalone --preferred-challenges tls-alpn-01 -d "$domain" \
-                --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "$hook"
+            certbot certonly --standalone --preferred-challenges tls-alpn-01 -d "$domain" --cert-name "$domain" \
+                --non-interactive --agree-tos --register-unsafely-without-email "${hook_args[@]}"
             ;;
         *)
             return 1
@@ -472,14 +483,18 @@ setup_hysteria2() {
     if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
         echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
     else
+        # Selfsteal-сайт (если есть) держит 80/tcp — на время выпуска останавливаем его
+        selfsteal_pause
         acme_preflight "$DOMAIN"
 
         echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN...${NC}"
-        if ! issue_certificate "$DOMAIN" "$NODE_PATH"; then
+        if ! issue_certificate "$DOMAIN" "docker compose -f $NODE_PATH/docker-compose.yml restart remnanode"; then
+            selfsteal_resume
             echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN. Конфигурация ноды не изменена.${NC}"
             read -p "Нажмите Enter, чтобы вернуться в меню..." || true
             return
         fi
+        selfsteal_resume
     fi
 
     COMPOSE_FILE="$NODE_PATH/docker-compose.yml"
@@ -885,7 +900,14 @@ crowdsec_bouncer_active() {
     systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null
 }
 
+# Selfsteal-сайт (если есть) держит 80/tcp — на время диагностики останавливаем его
 diagnose_acme() {
+    selfsteal_pause
+    diagnose_acme_run
+    selfsteal_resume
+}
+
+diagnose_acme_run() {
     echo -e "\n${CYAN}=== Диагностика выпуска сертификата ===${NC}"
     echo -e "${YELLOW}[*] Тест идёт через staging-сервер Let's Encrypt: боевые лимиты не тратятся.${NC}"
 
@@ -1332,6 +1354,1002 @@ diagnose_local_drop() {
     return 0
 }
 
+# =============================================================================
+# Selfsteal SNI для VLESS Reality
+# -----------------------------------------------------------------------------
+# У каждой ноды свой поддомен и локальный веб-сервер (Caddy или Nginx) с
+# настоящим сертификатом Let's Encrypt. Xray слушает 443 и передаёт «чужие»
+# подключения на этот сайт (127.0.0.1:9443) — нода маскируется сама под себя.
+# Сайт занимает 80/tcp (сертификат) и 127.0.0.1:9443, порт 443 остаётся Xray.
+# =============================================================================
+
+SELFSTEAL_DIR="/opt/selfsteal"
+SELFSTEAL_ENV="$SELFSTEAL_DIR/selfsteal.env"
+SELFSTEAL_KEYS="$SELFSTEAL_DIR/reality.keys"
+SELFSTEAL_INBOUND="$SELFSTEAL_DIR/inbound.json"
+SELFSTEAL_CONTAINERS="selfsteal-caddy selfsteal-nginx"
+SELFSTEAL_HOOK="remnautility-selfsteal.sh"
+SELFSTEAL_INBOUND_TAG="VLESS_REALITY_SELFSTEAL"
+SELFSTEAL_PAUSED=""
+
+pause_enter() {
+    read -p "Нажмите Enter, чтобы вернуться в меню..." || true
+}
+
+container_running() {
+    command -v docker >/dev/null 2>&1 || return 1
+    [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = "true" ]
+}
+
+# Приводим ввод к виду node1.example.com (без схемы, пути, точки в конце)
+normalize_domain() {
+    local d
+    d=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    d=${d#http://}; d=${d#https://}; d=${d%%/*}; d=${d%.}
+    echo "$d"
+}
+
+is_valid_domain() {
+    [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63}|xn--[a-z0-9-]{1,59})$ ]]
+}
+
+# Остановить selfsteal-контейнеры, чтобы освободить 80/tcp для certbot standalone.
+# Что остановили — запоминаем, selfsteal_resume запустит обратно.
+selfsteal_pause() {
+    local c
+    command -v docker >/dev/null 2>&1 || return 0
+    for c in $SELFSTEAL_CONTAINERS; do
+        if container_running "$c"; then
+            echo -e "${YELLOW}[*] Временно останавливаю $c — он занимает 80/tcp...${NC}"
+            if docker stop "$c" >/dev/null 2>&1; then
+                SELFSTEAL_PAUSED="$SELFSTEAL_PAUSED $c"
+            fi
+        fi
+    done
+    return 0
+}
+
+selfsteal_resume() {
+    local c
+    for c in $SELFSTEAL_PAUSED; do
+        if docker start "$c" >/dev/null 2>&1; then
+            echo -e "${GREEN}[*] $c снова запущен.${NC}"
+        else
+            echo -e "${RED}[!] Не удалось запустить $c. Запустите вручную: docker start $c${NC}"
+            sleep 3
+        fi
+    done
+    SELFSTEAL_PAUSED=""
+    return 0
+}
+
+selfsteal_load_env() {
+    SS_DOMAIN=""; SS_WEBSERVER=""; SS_PORT=""; SS_EXTRA_SNI=""
+    [ -f "$SELFSTEAL_ENV" ] || return 1
+    SS_DOMAIN=$(sed -n 's/^DOMAIN=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_WEBSERVER=$(sed -n 's/^WEBSERVER=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_PORT=$(sed -n 's/^PORT=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_EXTRA_SNI=$(sed -n 's/^EXTRA_SNI=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    [ -n "$SS_DOMAIN" ] && [ -n "$SS_WEBSERVER" ] && [ -n "$SS_PORT" ]
+}
+
+selfsteal_save_env() {
+    mkdir -p "$SELFSTEAL_DIR"
+    cat > "$SELFSTEAL_ENV" <<EOF
+# remnautility selfsteal — файл создаётся скриптом
+DOMAIN=$SS_DOMAIN
+WEBSERVER=$SS_WEBSERVER
+PORT=$SS_PORT
+EXTRA_SNI=$SS_EXTRA_SNI
+EOF
+}
+
+selfsteal_load_keys() {
+    REALITY_PRIVATE_KEY=""; REALITY_PUBLIC_KEY=""; REALITY_SHORT_ID=""
+    [ -f "$SELFSTEAL_KEYS" ] || return 1
+    REALITY_PRIVATE_KEY=$(sed -n 's/^PRIVATE_KEY=//p' "$SELFSTEAL_KEYS" | tail -n 1)
+    REALITY_PUBLIC_KEY=$(sed -n 's/^PUBLIC_KEY=//p' "$SELFSTEAL_KEYS" | tail -n 1)
+    REALITY_SHORT_ID=$(sed -n 's/^SHORT_ID=//p' "$SELFSTEAL_KEYS" | tail -n 1)
+    [ -n "$REALITY_PRIVATE_KEY" ] && [ -n "$REALITY_SHORT_ID" ]
+}
+
+selfsteal_save_keys() {
+    mkdir -p "$SELFSTEAL_DIR"
+    ( umask 077; printf 'PRIVATE_KEY=%s\nPUBLIC_KEY=%s\nSHORT_ID=%s\n' \
+        "$REALITY_PRIVATE_KEY" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" > "$SELFSTEAL_KEYS" )
+    chmod 600 "$SELFSTEAL_KEYS"
+}
+
+# Пара ключей x25519 для Reality (как `xray x25519`): сырые 32 байта в base64url без '='
+selfsteal_gen_keys() {
+    local tmp priv pub sid
+    tmp=$(mktemp)
+    if ! openssl genpkey -algorithm X25519 -out "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    priv=$(openssl pkey -in "$tmp" -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n' || true)
+    pub=$(openssl pkey -in "$tmp" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n' || true)
+    rm -f "$tmp"
+    sid=$(openssl rand -hex 8 2>/dev/null || true)
+    [ "${#priv}" -eq 43 ] && [ "${#pub}" -eq 43 ] && [ -n "$sid" ] || return 1
+    REALITY_PRIVATE_KEY=$priv
+    REALITY_PUBLIC_KEY=$pub
+    REALITY_SHORT_ID=$sid
+    return 0
+}
+
+# Хуки certbot: перед продлением останавливаем selfsteal (освобождаем 80/tcp для
+# standalone-сертификатов, например Hysteria2), после — запускаем обратно.
+# Nginx-вариант заодно подхватывает продлённый сертификат при старте.
+selfsteal_install_renew_hooks() {
+    local pre="/etc/letsencrypt/renewal-hooks/pre" post="/etc/letsencrypt/renewal-hooks/post"
+    mkdir -p "$pre" "$post"
+    cat > "$pre/$SELFSTEAL_HOOK" <<'EOF'
+#!/bin/sh
+# remnautility: освобождаем 80/tcp для certbot, останавливая selfsteal-сайт
+STATE=/run/remnautility-selfsteal.stopped
+: > "$STATE"
+command -v docker >/dev/null 2>&1 || exit 0
+for c in selfsteal-caddy selfsteal-nginx; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = "true" ]; then
+        docker stop "$c" >/dev/null 2>&1 && echo "$c" >> "$STATE"
+    fi
+done
+exit 0
+EOF
+    cat > "$post/$SELFSTEAL_HOOK" <<'EOF'
+#!/bin/sh
+# remnautility: запускаем обратно selfsteal-сайт, остановленный pre-хуком
+STATE=/run/remnautility-selfsteal.stopped
+[ -f "$STATE" ] || exit 0
+while read -r c; do
+    [ -n "$c" ] && docker start "$c" >/dev/null 2>&1
+done < "$STATE"
+rm -f "$STATE"
+exit 0
+EOF
+    chmod 755 "$pre/$SELFSTEAL_HOOK" "$post/$SELFSTEAL_HOOK"
+}
+
+selfsteal_remove_renew_hooks() {
+    rm -f "/etc/letsencrypt/renewal-hooks/pre/$SELFSTEAL_HOOK" \
+          "/etc/letsencrypt/renewal-hooks/post/$SELFSTEAL_HOOK"
+}
+
+# Автопродление certbot. Штатного таймера нет, например, у certbot из venv.
+ensure_certbot_renew_timer() {
+    local certbot_bin
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if ! certbot_is_venv; then
+        if systemctl is-active --quiet certbot.timer 2>/dev/null \
+            || systemctl is-active --quiet snap.certbot.renew.timer 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if systemctl is-active --quiet remnautility-certbot-renew.timer 2>/dev/null; then
+        return 0
+    fi
+    certbot_bin=$(command -v certbot || true)
+    [ -n "$certbot_bin" ] || return 0
+
+    echo -e "${YELLOW}[*] Штатного таймера автопродления certbot нет — создаю remnautility-certbot-renew.timer...${NC}"
+    cat > /etc/systemd/system/remnautility-certbot-renew.service <<EOF
+[Unit]
+Description=Certbot renew (remnautility)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$certbot_bin renew --quiet
+EOF
+    cat > /etc/systemd/system/remnautility-certbot-renew.timer <<'EOF'
+[Unit]
+Description=Certbot renew twice a day (remnautility)
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now remnautility-certbot-renew.timer >/dev/null 2>&1; then
+        echo -e "${GREEN}[*] ✅ Автопродление включено (дважды в сутки).${NC}"
+    else
+        echo -e "${RED}[!] Не удалось включить таймер. Продлевайте вручную: certbot renew${NC}"
+    fi
+    return 0
+}
+
+# Сайт-заглушка: правдоподобная страница вместо дефолтной.
+# $1 — каталог, $2 — домен, $3 — шаблон (cloud | studio | maintenance)
+selfsteal_write_site() {
+    local dir="$1" domain="$2" tpl="$3" brand root year accent
+    local accents=("#2563eb" "#7c3aed" "#0d9488" "#db2777" "#ea580c" "#4f46e5" "#059669")
+    brand=$(echo "$domain" | awk -F. '{ if (NF >= 2) print $(NF-1); else print $1 }' | tr '-' ' ')
+    brand="${brand^}"
+    root=$(echo "$domain" | awk -F. '{ if (NF >= 2) print $(NF-1) "." $NF; else print $0 }')
+    year=$(date +%Y)
+    accent=${accents[$((RANDOM % ${#accents[@]}))]}
+    mkdir -p "$dir"
+
+    case "$tpl" in
+        cloud)
+            cat > "$dir/index.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${brand} Cloud — Sign in</title>
+<link rel="icon" href="data:,">
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f4f6fb;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#1f2937}
+.card{width:380px;max-width:92vw;background:#fff;border-radius:14px;box-shadow:0 10px 30px rgba(15,23,42,.08);padding:36px 32px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:20px;margin-bottom:26px}
+.logo i{width:34px;height:34px;border-radius:9px;background:${accent};display:inline-block}
+h1{font-size:19px;margin:0 0 6px}p{margin:0 0 20px;color:#6b7280;font-size:14px}
+label{display:block;font-size:13px;margin:14px 0 6px;color:#374151}
+input{width:100%;padding:11px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px}
+button{width:100%;margin-top:22px;padding:12px;border:0;border-radius:8px;background:${accent};color:#fff;font-size:15px;cursor:pointer}
+.err{min-height:18px;margin-top:12px;color:#dc2626;font-size:13px;text-align:center}
+.foot{margin-top:10px;text-align:center;font-size:12px;color:#9ca3af}
+</style>
+</head>
+<body>
+<form class="card" onsubmit="document.getElementById('err').textContent='Incorrect email or password.';return false">
+<div class="logo"><i></i>${brand} Cloud</div>
+<h1>Sign in</h1>
+<p>Use your organization account to access shared files.</p>
+<label for="email">Email</label><input id="email" type="email" autocomplete="username" required>
+<label for="pass">Password</label><input id="pass" type="password" autocomplete="current-password" required>
+<button type="submit">Continue</button>
+<div class="err" id="err"></div>
+<div class="foot">&copy; ${year} ${brand}. All rights reserved.</div>
+</form>
+</body>
+</html>
+EOF
+            ;;
+        studio)
+            cat > "$dir/index.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${brand} Studio — Design &amp; Development</title>
+<meta name="description" content="${brand} Studio designs and builds websites, apps and brand identities.">
+<link rel="icon" href="data:,">
+<style>
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#111827;line-height:1.6}
+.wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+header{display:flex;justify-content:space-between;align-items:center;padding:28px 0}
+.brand{font-weight:800;font-size:21px;letter-spacing:-.02em}.brand b{color:${accent}}
+nav a{color:#4b5563;text-decoration:none;margin-left:24px;font-size:15px}
+.hero{padding:72px 0 56px}.hero h1{font-size:46px;line-height:1.15;margin:0 0 18px;letter-spacing:-.03em;max-width:720px}
+.hero p{font-size:19px;color:#4b5563;max-width:600px;margin:0 0 30px}
+.btn{display:inline-block;background:${accent};color:#fff;padding:13px 24px;border-radius:10px;text-decoration:none;font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;padding:24px 0 72px}
+.card{border:1px solid #e5e7eb;border-radius:14px;padding:26px}.card h3{margin:0 0 8px;font-size:18px}.card p{margin:0;color:#6b7280;font-size:15px}
+footer{border-top:1px solid #e5e7eb;padding:26px 0;color:#9ca3af;font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header><div class="brand">${brand}<b>.</b></div><nav><a href="#services">Services</a><a href="#contact">Contact</a></nav></header>
+<section class="hero">
+<h1>We design and build digital products people enjoy using.</h1>
+<p>${brand} is an independent studio helping startups and established teams ship websites, mobile apps and brand identities.</p>
+<a class="btn" href="mailto:hello@${root}">Start a project</a>
+</section>
+<section class="grid" id="services">
+<div class="card"><h3>Product design</h3><p>Research, prototyping and interface design grounded in real user needs.</p></div>
+<div class="card"><h3>Web development</h3><p>Fast, accessible websites and web apps built on modern, maintainable stacks.</p></div>
+<div class="card"><h3>Brand identity</h3><p>Logos, typography and visual systems that stay consistent everywhere.</p></div>
+</section>
+</div>
+<footer id="contact"><div class="wrap">&copy; ${year} ${brand} Studio &middot; hello@${root}</div></footer>
+</body>
+</html>
+EOF
+            ;;
+        *)
+            cat > "$dir/index.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${brand} — Scheduled maintenance</title>
+<link rel="icon" href="data:,">
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;text-align:center}
+.box{max-width:520px;padding:32px}
+.dot{width:64px;height:64px;border-radius:50%;margin:0 auto 28px;border:4px solid ${accent};border-top-color:transparent;animation:s 1.4s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+h1{font-size:30px;margin:0 0 14px}p{color:#94a3b8;font-size:16px;line-height:1.6;margin:0 0 10px}
+a{color:${accent};text-decoration:none}
+</style>
+</head>
+<body>
+<div class="box">
+<div class="dot"></div>
+<h1>We'll be back shortly</h1>
+<p>${brand} is undergoing scheduled maintenance to improve performance and reliability. Thank you for your patience.</p>
+<p>Questions? <a href="mailto:support@${root}">support@${root}</a></p>
+</div>
+</body>
+</html>
+EOF
+            ;;
+    esac
+    printf 'User-agent: *\nDisallow:\n' > "$dir/robots.txt"
+}
+
+# Caddy: сам получает сертификат по HTTP-01 на 80/tcp, сайт — на 127.0.0.1:$port
+selfsteal_write_caddy() {
+    local domain="$1" port="$2"
+    cat > "$SELFSTEAL_DIR/docker-compose.yml" <<'EOF'
+services:
+  caddy:
+    image: caddy:latest
+    container_name: selfsteal-caddy
+    restart: always
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./html:/var/www/html
+      - caddy-data:/data
+volumes:
+  caddy-data:
+EOF
+    cat > "$SELFSTEAL_DIR/Caddyfile" <<EOF
+{
+    https_port $port
+    default_bind 127.0.0.1
+    auto_https disable_redirects
+}
+
+http://$domain {
+    bind 0.0.0.0
+    redir https://{host}{uri} permanent
+}
+
+https://$domain {
+    root * /var/www/html
+    file_server
+}
+EOF
+}
+
+# Nginx: сертификат от certbot (/etc/letsencrypt), 80/tcp — редирект, сайт — на 127.0.0.1:$port
+selfsteal_write_nginx() {
+    local domain="$1" port="$2"
+    cat > "$SELFSTEAL_DIR/docker-compose.yml" <<'EOF'
+services:
+  nginx:
+    image: nginx:stable-alpine
+    container_name: selfsteal-nginx
+    restart: always
+    network_mode: host
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./html:/var/www/html:ro
+      - /etc/letsencrypt/live:/etc/letsencrypt/live:ro
+      - /etc/letsencrypt/archive:/etc/letsencrypt/archive:ro
+EOF
+    cat > "$SELFSTEAL_DIR/nginx.conf" <<EOF
+server {
+    listen 80 default_server;
+    server_name $domain;
+    server_tokens off;
+    return 301 https://$domain\$request_uri;
+}
+
+server {
+    listen 127.0.0.1:$port ssl default_server;
+    http2 on;
+    server_name $domain;
+    server_tokens off;
+
+    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+}
+
+# HTTP-код сайта на 127.0.0.1:$2 с SNI $1 и проверкой сертификата (000 — TLS не прошёл)
+selfsteal_local_check() {
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null || true
+}
+
+# Версия HTTP при TLS 1.3 + HTTP/2 ("2" — сайт годится как target для Reality)
+selfsteal_h2_tls13() {
+    curl -s -o /dev/null -w '%{http_version}' --http2 --tlsv1.3 --max-time 5 \
+        --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null || true
+}
+
+selfsteal_wait_ready() {
+    local domain="$1" port="$2" timeout="$3" waited=0
+    while [ "$waited" -lt "$timeout" ]; do
+        if [ "$(selfsteal_local_check "$domain" "$port")" = "200" ]; then
+            echo
+            return 0
+        fi
+        printf '.'
+        sleep 3
+        waited=$((waited + 3))
+    done
+    echo
+    return 1
+}
+
+# Ошибки из логов контейнера (выдача сертификата, конфиг)
+selfsteal_show_errors() {
+    docker logs --tail 60 "$1" 2>&1 | grep -iE 'error|fail|emerg|challenge' | tail -n 12 | sed 's/^/    /' || true
+}
+
+# Проверки перед установкой. Возвращает 1, если пользователь решил не продолжать.
+selfsteal_preflight() {
+    local domain="$1" port="$2" server_ip domain_ip busy answer problems=0
+    local node_compose="/opt/remnanode/docker-compose.yml"
+    echo -e "\n${CYAN}[*] Проверка перед установкой...${NC}"
+
+    server_ip=$(detect_public_ip || true)
+    domain_ip=$(resolve_domain_ip "$domain" || true)
+    if [ -z "$domain_ip" ]; then
+        echo -e "${RED}[!] $domain не резолвится в IPv4. Создайте A-запись: $domain → ${server_ip:-<IP ноды>}${NC}"
+        problems=1
+    elif [ -n "$server_ip" ] && [ "$domain_ip" != "$server_ip" ]; then
+        echo -e "${RED}[!] $domain указывает на $domain_ip, а IP этой ноды — $server_ip.${NC}"
+        if domain_uses_cloudflare "$domain"; then
+            echo -e "${YELLOW}    Домен в Cloudflare — похоже, включено проксирование (оранжевое облако).${NC}"
+            echo -e "${YELLOW}    Переключите запись в «DNS only» (серое облако): через прокси Cloudflare это не работает.${NC}"
+        fi
+        problems=1
+    elif [ -z "$server_ip" ]; then
+        echo -e "${YELLOW}[*] $domain -> $domain_ip (внешний IP ноды определить не удалось).${NC}"
+    else
+        echo -e "${GREEN}[*] ✅ $domain -> $domain_ip совпадает с IP ноды.${NC}"
+    fi
+
+    busy=$(port_listener_info 80)
+    if [ -n "$busy" ]; then
+        echo -e "${RED}[!] Порт 80/tcp занят — он нужен сайту для получения сертификата:${NC}"
+        echo "$busy" | sed 's/^/    /'
+        problems=1
+    else
+        echo -e "${GREEN}[*] ✅ Порт 80/tcp свободен.${NC}"
+    fi
+
+    busy=$(port_listener_info "$port")
+    if [ -n "$busy" ]; then
+        echo -e "${RED}[!] Порт $port занят — выберите другой локальный порт:${NC}"
+        echo "$busy" | sed 's/^/    /'
+        problems=1
+    fi
+
+    busy=$(port_listener_info 443)
+    if [ -z "$busy" ]; then
+        echo -e "${CYAN}[*] Порт 443/tcp пока свободен — его займёт Xray, когда вы добавите inbound в панели.${NC}"
+    elif echo "$busy" | grep -qE 'xray|rw-core'; then
+        echo -e "${GREEN}[*] ✅ Порт 443/tcp слушает Xray.${NC}"
+    else
+        echo -e "${RED}[!] Порт 443/tcp занят НЕ Xray — inbound на 443 не запустится:${NC}"
+        echo "$busy" | sed 's/^/    /'
+        problems=1
+    fi
+
+    if [ -f "$node_compose" ] && ! grep -qE '^[[:space:]]*network_mode:[[:space:]]*"?host"?' "$node_compose"; then
+        echo -e "${RED}[!] В $node_compose нет network_mode: host —${NC}"
+        echo -e "${RED}    Xray в контейнере ноды не увидит сайт на 127.0.0.1:$port.${NC}"
+        problems=1
+    fi
+
+    firewall_allow_port 80 "Let's Encrypt не выдаст сертификат"
+    firewall_allow_port 443 "клиенты не подключатся к Xray"
+
+    if [ "$problems" = "1" ]; then
+        read -p "Есть проблемы (см. выше). Всё равно продолжить? (y/n): " answer || return 1
+        [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    fi
+    return 0
+}
+
+selfsteal_install() {
+    echo -e "\n${CYAN}=== Установка selfsteal-сайта ===${NC}"
+
+    if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+        echo -e "${RED}[!] Не найден Docker с плагином compose (он нужен и самой ноде).${NC}"
+        echo -e "${YELLOW}    Установите ноду (пункт 1 главного меню) или Docker: curl -fsSL https://get.docker.com | sh${NC}"
+        pause_enter
+        return 0
+    fi
+
+    local old_domain="" old_ws="" old_port="" old_extra=""
+    if selfsteal_load_env; then
+        old_domain=$SS_DOMAIN; old_ws=$SS_WEBSERVER; old_port=$SS_PORT; old_extra=$SS_EXTRA_SNI
+        echo -e "${YELLOW}[*] Уже установлено: $old_domain ($old_ws → 127.0.0.1:$old_port). Будет перенастроено.${NC}"
+    fi
+
+    echo -e "${CYAN}[*] Нужна A-запись «домен ноды → IP этой ноды». В Cloudflare — режим «DNS only» (серое облако).${NC}"
+    local domain
+    while true; do
+        read -p "Домен этой ноды (например, node1.example.com)${old_domain:+ [$old_domain]}: " domain || return 0
+        domain=$(normalize_domain "${domain:-$old_domain}")
+        if is_valid_domain "$domain"; then break; fi
+        echo -e "${RED}[!] Некорректный домен: '$domain'.${NC}"
+    done
+
+    local ws ws_choice ws_default=1
+    if [ "$old_ws" = "nginx" ]; then ws_default=2; fi
+    echo -e "\nВеб-сервер для сайта-заглушки:"
+    echo -e "  ${YELLOW}1.${NC} Caddy — сам получает и продлевает сертификат (проще всего)"
+    echo -e "  ${YELLOW}2.${NC} Nginx — сертификат через certbot; если хостер режет 80/tcp,"
+    echo -e "     можно выпустить через DNS-01 Cloudflare"
+    read -p "Выберите (1-2) [$ws_default]: " ws_choice || return 0
+    case "${ws_choice:-$ws_default}" in
+        1) ws="caddy" ;;
+        2) ws="nginx" ;;
+        *) echo -e "${RED}Неверный выбор.${NC}"; sleep 1; return 0 ;;
+    esac
+
+    local port
+    while true; do
+        read -p "Локальный порт сайта на 127.0.0.1 [${old_port:-9443}]: " port || return 0
+        port=${port:-${old_port:-9443}}
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then break; fi
+        echo -e "${RED}[!] Нужен номер порта от 1024 до 65535.${NC}"
+    done
+
+    local tpl="" answer
+    local templates=(cloud studio maintenance)
+    if [ -f "$SELFSTEAL_DIR/html/index.html" ]; then
+        read -p "Оставить текущую страницу-заглушку из $SELFSTEAL_DIR/html? (Y/n): " answer || return 0
+        if [[ "$answer" =~ ^[Nn]$ ]]; then tpl="ask"; fi
+    else
+        tpl="ask"
+    fi
+    if [ "$tpl" = "ask" ]; then
+        echo -e "\nСтраница-заглушка (лучше не дефолтная):"
+        echo -e "  ${YELLOW}1.${NC} Вход в облачное хранилище"
+        echo -e "  ${YELLOW}2.${NC} Лендинг веб-студии"
+        echo -e "  ${YELLOW}3.${NC} «Ведутся технические работы»"
+        echo -e "  ${YELLOW}4.${NC} Случайная из этих"
+        read -p "Выберите (1-4) [4]: " answer || return 0
+        case "${answer:-4}" in
+            1) tpl="cloud" ;;
+            2) tpl="studio" ;;
+            3) tpl="maintenance" ;;
+            *) tpl=${templates[$((RANDOM % ${#templates[@]}))]} ;;
+        esac
+    fi
+
+    # Прежний сайт держит 80/tcp и локальный порт — останавливаем на время проверок
+    selfsteal_pause
+    if ! selfsteal_preflight "$domain" "$port"; then
+        echo -e "${YELLOW}[*] Установка отменена.${NC}"
+        selfsteal_resume
+        pause_enter
+        return 0
+    fi
+
+    if [ "$ws" = "nginx" ]; then
+        if ! ensure_certbot; then
+            selfsteal_resume
+            pause_enter
+            return 0
+        fi
+        if [ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/$domain/privkey.pem" ]; then
+            echo -e "${GREEN}[*] ✅ Сертификат для $domain уже есть — использую его.${NC}"
+        else
+            echo -e "${GREEN}[*] Выпуск сертификата для $domain...${NC}"
+            if ! issue_certificate "$domain" "docker exec selfsteal-nginx nginx -s reload >/dev/null 2>&1 || true"; then
+                echo -e "${RED}[!] Сертификат не выпущен — сайт не установлен.${NC}"
+                selfsteal_resume
+                pause_enter
+                return 0
+            fi
+        fi
+    fi
+
+    # Убираем прежние контейнеры (в том числе при смене Caddy <-> Nginx)
+    local c
+    if [ -f "$SELFSTEAL_DIR/docker-compose.yml" ]; then
+        docker compose -f "$SELFSTEAL_DIR/docker-compose.yml" down --remove-orphans >/dev/null 2>&1 || true
+        cp "$SELFSTEAL_DIR/docker-compose.yml" "$SELFSTEAL_DIR/docker-compose.yml.bak"
+    fi
+    for c in $SELFSTEAL_CONTAINERS; do
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+    SELFSTEAL_PAUSED=""
+
+    echo -e "${GREEN}[*] Записываю конфигурацию в $SELFSTEAL_DIR...${NC}"
+    mkdir -p "$SELFSTEAL_DIR/html"
+    if [ -n "$tpl" ]; then
+        selfsteal_write_site "$SELFSTEAL_DIR/html" "$domain" "$tpl"
+    fi
+    if [ "$ws" = "caddy" ]; then
+        selfsteal_write_caddy "$domain" "$port"
+        rm -f "$SELFSTEAL_DIR/nginx.conf"
+    else
+        selfsteal_write_nginx "$domain" "$port"
+        rm -f "$SELFSTEAL_DIR/Caddyfile"
+    fi
+
+    SS_DOMAIN=$domain; SS_WEBSERVER=$ws; SS_PORT=$port
+    if [ "$domain" = "$old_domain" ]; then SS_EXTRA_SNI=$old_extra; else SS_EXTRA_SNI=""; fi
+    selfsteal_save_env
+    selfsteal_install_renew_hooks
+    if [ "$ws" = "nginx" ]; then ensure_certbot_renew_timer; fi
+
+    echo -e "${GREEN}[*] Загрузка образа и запуск контейнера...${NC}"
+    if ! docker compose -f "$SELFSTEAL_DIR/docker-compose.yml" pull --quiet; then
+        echo -e "${YELLOW}[!] Не удалось обновить образ — пробую запустить с тем, что есть.${NC}"
+    fi
+    if ! docker compose -f "$SELFSTEAL_DIR/docker-compose.yml" up -d --remove-orphans; then
+        echo -e "${RED}[!] Контейнер не запустился (см. вывод выше).${NC}"
+        pause_enter
+        return 0
+    fi
+
+    local container="selfsteal-$ws" timeout=20
+    if [ "$ws" = "caddy" ]; then
+        timeout=150
+        echo -ne "${CYAN}[*] Caddy получает сертификат Let's Encrypt (до ${timeout} с)${NC}"
+    else
+        echo -ne "${CYAN}[*] Жду ответа сайта${NC}"
+    fi
+    if selfsteal_wait_ready "$domain" "$port" "$timeout"; then
+        echo -e "${GREEN}[*] ✅ Сайт отвечает на 127.0.0.1:$port с валидным сертификатом для $domain.${NC}"
+        if [ "$(selfsteal_h2_tls13 "$domain" "$port")" = "2" ]; then
+            echo -e "${GREEN}[*] ✅ TLS 1.3 + HTTP/2 — подходит как target для Reality.${NC}"
+        else
+            echo -e "${YELLOW}[!] Не удалось подтвердить TLS 1.3 + HTTP/2 — Reality требует оба.${NC}"
+        fi
+    else
+        echo -e "${RED}[!] За ${timeout} с сайт не ответил с валидным сертификатом. Ошибки из лога:${NC}"
+        selfsteal_show_errors "$container"
+        if [ "$ws" = "caddy" ]; then
+            echo -e "${YELLOW}    Caddy будет повторять попытки сам. Частая причина — недоступен 80/tcp снаружи:${NC}"
+            echo -e "${YELLOW}    пункт 8 главного меню покажет, где режется трафик. Если 80/tcp закрыт${NC}"
+            echo -e "${YELLOW}    хостером — переустановите с Nginx: он умеет DNS-01 через Cloudflare.${NC}"
+        fi
+        echo -e "${YELLOW}    Проверить позже: пункт 2 этого меню или docker logs $container${NC}"
+    fi
+
+    echo -e "\n${GREEN}✅ Selfsteal-сайт установлен: $ws, $domain → 127.0.0.1:$port${NC}"
+    echo -e "    Файлы: $SELFSTEAL_DIR (свою страницу можно положить в $SELFSTEAL_DIR/html)"
+    echo -e "    Осталось добавить inbound и Host в панели Remnawave."
+    read -p "Показать настройки для панели сейчас? (Y/n): " answer || return 0
+    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+        selfsteal_show_panel
+    fi
+    return 0
+}
+
+# Inbound для Config Profile в виде JSON
+selfsteal_inbound_json() {
+    local names="" d
+    for d in $SS_DOMAIN $SS_EXTRA_SNI; do
+        names="${names:+$names, }\"$d\""
+    done
+    cat <<EOF
+{
+  "tag": "$SELFSTEAL_INBOUND_TAG",
+  "port": 443,
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "xver": 0,
+      "target": "127.0.0.1:$SS_PORT",
+      "serverNames": [$names],
+      "privateKey": "$REALITY_PRIVATE_KEY",
+      "shortIds": ["", "$REALITY_SHORT_ID"]
+    }
+  }
+}
+EOF
+}
+
+selfsteal_show_panel() {
+    echo -e "\n${CYAN}=== Настройки для панели Remnawave ===${NC}"
+    if ! selfsteal_load_env; then
+        echo -e "${RED}[!] Selfsteal не установлен — сначала пункт 1.${NC}"
+        pause_enter
+        return 0
+    fi
+
+    local answer mode mode_default=1 input d extra
+    if selfsteal_load_keys; then
+        echo -e "${GREEN}[*] Найдены сохранённые ключи Reality ($SELFSTEAL_KEYS).${NC}"
+        read -p "Сгенерировать новую пару ключей? (y/N): " answer || return 0
+    else
+        answer="y"
+    fi
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        if selfsteal_gen_keys; then
+            selfsteal_save_keys
+            echo -e "${GREEN}[*] ✅ Сгенерированы новые ключи x25519 и shortId.${NC}"
+        else
+            echo -e "${RED}[!] Не удалось сгенерировать ключи через openssl.${NC}"
+            echo -e "${YELLOW}    Сгенерируйте их кнопкой в редакторе профиля или командой: xray x25519${NC}"
+            REALITY_PRIVATE_KEY="<x25519 private key>"; REALITY_PUBLIC_KEY=""
+            REALITY_SHORT_ID=$(openssl rand -hex 8 2>/dev/null || echo "a1b2c3d4")
+        fi
+    fi
+
+    if [ -n "$SS_EXTRA_SNI" ]; then mode_default=2; fi
+    echo -e "\nКак устроен Config Profile в панели?"
+    echo -e "  ${YELLOW}1.${NC} Отдельный профиль на каждую ноду: в serverNames только $SS_DOMAIN (рекомендуется)"
+    echo -e "  ${YELLOW}2.${NC} Один общий профиль на все ноды: в serverNames домены всех нод"
+    read -p "Выберите (1-2) [$mode_default]: " mode || return 0
+    mode=${mode:-$mode_default}
+    if [ "$mode" = "2" ]; then
+        read -p "Домены остальных нод через пробел или запятую${SS_EXTRA_SNI:+ [$SS_EXTRA_SNI]}: " input || return 0
+        input=${input:-$SS_EXTRA_SNI}
+        extra=""
+        for d in $(echo "$input" | tr ',;' '  '); do
+            d=$(normalize_domain "$d")
+            [ -z "$d" ] && continue
+            [ "$d" = "$SS_DOMAIN" ] && continue
+            case " $extra " in *" $d "*) continue ;; esac
+            if is_valid_domain "$d"; then
+                extra="${extra:+$extra }$d"
+            else
+                echo -e "${YELLOW}[!] Пропускаю некорректный домен: $d${NC}"
+            fi
+        done
+        SS_EXTRA_SNI=$extra
+    else
+        SS_EXTRA_SNI=""
+    fi
+    selfsteal_save_env
+
+    # В файле приватный ключ — только для root
+    ( umask 077; selfsteal_inbound_json > "$SELFSTEAL_INBOUND" )
+    chmod 600 "$SELFSTEAL_INBOUND"
+
+    echo -e "\n${CYAN}────────── 1. Inbound → Config Profile ──────────${NC}"
+    echo -e "Панель → Config Profiles → профиль ноды → добавьте в массив \"inbounds\":\n"
+    cat "$SELFSTEAL_INBOUND"
+    echo -e "\n(сохранено в $SELFSTEAL_INBOUND)"
+    echo -e "  • Публичный ключ панель подставит в подписку сама."
+    if [ -n "$REALITY_PUBLIC_KEY" ]; then
+        echo -e "    Для справки, public key: $REALITY_PUBLIC_KEY"
+    fi
+    echo -e "  • В старых версиях Xray поле называется ${YELLOW}dest${NC}, а не ${YELLOW}target${NC}."
+    echo -e "  • Нода работает с network_mode: host, поэтому Xray видит сайт на 127.0.0.1:$SS_PORT."
+    if [ "$mode" = "2" ]; then
+        echo -e "  • ${YELLOW}Общий профиль:${NC} если он уже создан на другой ноде, privateKey и shortIds"
+        echo -e "    в нём НЕ меняйте — достаточно добавить $SS_DOMAIN в serverNames."
+        echo -e "    Минус схемы: нода примет SNI соседней ноды, а сертификата под него у её сайта нет."
+        echo -e "    target у всех нод локальный (127.0.0.1:<порт>) — порт должен совпадать на всех нодах."
+    else
+        echo -e "  • Отдельный профиль выбирается при создании ноды (Core Configuration)."
+    fi
+
+    echo -e "\n${CYAN}────────── 2. Host ──────────${NC}"
+    echo -e "Панель → Hosts → новый Host на inbound $SELFSTEAL_INBOUND_TAG:"
+    echo -e "  Address:     ${GREEN}$SS_DOMAIN${NC}"
+    echo -e "  Port:        ${GREEN}443${NC}"
+    echo -e "  SNI:         ${GREEN}$SS_DOMAIN${NC}"
+    echo -e "  Fingerprint: ${GREEN}chrome${NC}"
+    echo -e "  Главное — SNI хоста должен совпадать с доменом именно этой ноды."
+
+    echo -e "\n${CYAN}────────── 3. Проверка ──────────${NC}"
+    echo -e "  Откройте https://$SS_DOMAIN в браузере: должна загрузиться заглушка с валидным"
+    echo -e "  сертификатом (её отдаёт Xray, прозрачно проксируя запрос на сайт)."
+    echo -e "  Затем подключитесь клиентом по подписке. Цепочку проверяет пункт 2 этого меню."
+    echo
+    pause_enter
+    return 0
+}
+
+selfsteal_status() {
+    echo -e "\n${CYAN}=== Статус selfsteal ===${NC}"
+    if ! selfsteal_load_env; then
+        echo -e "${YELLOW}[*] Selfsteal не установлен.${NC}"
+        pause_enter
+        return 0
+    fi
+
+    local container="selfsteal-$SS_WEBSERVER" state server_ip domain_ip code cert issuer not_after exp_ts days
+    echo -e "  Домен:       $SS_DOMAIN"
+    echo -e "  Веб-сервер:  $SS_WEBSERVER (контейнер $container)"
+    echo -e "  Сайт:        127.0.0.1:$SS_PORT"
+    if [ -n "$SS_EXTRA_SNI" ]; then
+        echo -e "  Общий профиль, другие SNI: $SS_EXTRA_SNI"
+    fi
+    echo
+
+    state=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)
+    if [ "$state" = "running" ]; then
+        echo -e "${GREEN}[*] ✅ Контейнер работает.${NC}"
+    else
+        echo -e "${RED}[!] Контейнер: ${state:-не найден}. Запуск: docker compose -f $SELFSTEAL_DIR/docker-compose.yml up -d${NC}"
+    fi
+
+    server_ip=$(detect_public_ip || true)
+    domain_ip=$(resolve_domain_ip "$SS_DOMAIN" || true)
+    if [ -z "$domain_ip" ]; then
+        echo -e "${RED}[!] $SS_DOMAIN не резолвится в IPv4 — проверьте A-запись.${NC}"
+    elif [ -n "$server_ip" ] && [ "$domain_ip" != "$server_ip" ]; then
+        echo -e "${RED}[!] $SS_DOMAIN -> $domain_ip, а IP ноды — $server_ip (в Cloudflare нужен «DNS only»).${NC}"
+    else
+        echo -e "${GREEN}[*] ✅ DNS: $SS_DOMAIN -> $domain_ip${NC}"
+    fi
+
+    code=$(selfsteal_local_check "$SS_DOMAIN" "$SS_PORT")
+    if [ "$code" = "200" ]; then
+        echo -e "${GREEN}[*] ✅ Сайт на 127.0.0.1:$SS_PORT отвечает с валидным сертификатом.${NC}"
+    else
+        echo -e "${RED}[!] Сайт на 127.0.0.1:$SS_PORT не отвечает с валидным сертификатом (код $code).${NC}"
+        if [ "$state" = "running" ]; then
+            selfsteal_show_errors "$container"
+        fi
+    fi
+
+    cert=$(echo | timeout 6 openssl s_client -connect "127.0.0.1:$SS_PORT" -servername "$SS_DOMAIN" 2>/dev/null \
+        | openssl x509 -noout -issuer -enddate 2>/dev/null || true)
+    if [ -n "$cert" ]; then
+        issuer=$(echo "$cert" | sed -n 's/^issuer=//p')
+        not_after=$(echo "$cert" | sed -n 's/^notAfter=//p')
+        exp_ts=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
+        days=$(( (exp_ts - $(date +%s)) / 86400 ))
+        echo -e "${CYAN}[*] Сертификат: $issuer; действует до $not_after (осталось дней: $days).${NC}"
+    fi
+
+    if [ "$code" = "200" ]; then
+        if [ "$(selfsteal_h2_tls13 "$SS_DOMAIN" "$SS_PORT")" = "2" ]; then
+            echo -e "${GREEN}[*] ✅ TLS 1.3 + HTTP/2 — подходит как target для Reality.${NC}"
+        else
+            echo -e "${YELLOW}[!] Не удалось подтвердить TLS 1.3 + HTTP/2 — Reality требует оба.${NC}"
+        fi
+    fi
+
+    local l443
+    l443=$(port_listener_info 443)
+    if [ -z "$l443" ]; then
+        echo -e "${YELLOW}[!] Порт 443/tcp никто не слушает — inbound ещё не добавлен в профиль ноды.${NC}"
+    else
+        if echo "$l443" | grep -qE 'xray|rw-core'; then
+            echo -e "${GREEN}[*] ✅ Порт 443/tcp слушает Xray.${NC}"
+        else
+            echo -e "${RED}[!] Порт 443/tcp слушает не Xray:${NC}"
+            echo "$l443" | sed 's/^/    /'
+        fi
+        # Полная цепочка: клиент → Xray(443) → сайт. Так же увидит сайт браузер.
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+            --resolve "$SS_DOMAIN:443:127.0.0.1" "https://$SS_DOMAIN/" 2>/dev/null || true)
+        if [ "$code" = "200" ]; then
+            echo -e "${GREEN}[*] ✅ Цепочка работает: https://$SS_DOMAIN через Xray (443) отдаёт заглушку.${NC}"
+        else
+            echo -e "${RED}[!] Через 443 сайт не открывается (код $code). Проверьте в панели:${NC}"
+            echo -e "    • inbound $SELFSTEAL_INBOUND_TAG есть в профиле ЭТОЙ ноды и профиль применён"
+            echo -e "    • target = 127.0.0.1:$SS_PORT (в старых Xray — dest)"
+            echo -e "    • $SS_DOMAIN есть в serverNames"
+        fi
+    fi
+
+    if [ -x "/etc/letsencrypt/renewal-hooks/pre/$SELFSTEAL_HOOK" ]; then
+        echo -e "${GREEN}[*] ✅ Хуки certbot на месте: при продлении сертификатов сайт освобождает 80/tcp.${NC}"
+    else
+        echo -e "${YELLOW}[!] Нет хуков certbot — продление standalone-сертификатов упрётся в занятый 80/tcp.${NC}"
+        echo -e "${YELLOW}    Переустановите selfsteal (пункт 1), чтобы их вернуть.${NC}"
+    fi
+    echo
+    pause_enter
+    return 0
+}
+
+selfsteal_remove() {
+    echo -e "\n${CYAN}=== Удаление selfsteal ===${NC}"
+    if [ ! -d "$SELFSTEAL_DIR" ]; then
+        echo -e "${YELLOW}[*] Selfsteal не установлен ($SELFSTEAL_DIR нет).${NC}"
+        pause_enter
+        return 0
+    fi
+    selfsteal_load_env || true
+
+    local answer c down_args=(down --remove-orphans)
+    read -p "Удалить selfsteal-сайт${SS_DOMAIN:+ $SS_DOMAIN}? (y/n): " answer || return 0
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+
+    if [ "$SS_WEBSERVER" = "caddy" ]; then
+        read -p "Удалить и том с сертификатами Caddy (caddy-data)? (y/N): " answer || answer=""
+        if [[ "$answer" =~ ^[Yy]$ ]]; then down_args+=(-v); fi
+    fi
+    if [ -f "$SELFSTEAL_DIR/docker-compose.yml" ]; then
+        docker compose -f "$SELFSTEAL_DIR/docker-compose.yml" "${down_args[@]}" || true
+    fi
+    for c in $SELFSTEAL_CONTAINERS; do
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+    selfsteal_remove_renew_hooks
+
+    if [ "$SS_WEBSERVER" = "nginx" ] && [ -n "$SS_DOMAIN" ] && [ -d "/etc/letsencrypt/live/$SS_DOMAIN" ]; then
+        if grep -qs "/etc/letsencrypt/live/$SS_DOMAIN/" /opt/remnanode/docker-compose.yml; then
+            echo -e "${CYAN}[*] Сертификат $SS_DOMAIN использует нода (Hysteria2) — оставляю его.${NC}"
+        else
+            read -p "Удалить и сертификат certbot для $SS_DOMAIN? (y/N): " answer || answer=""
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                certbot delete --cert-name "$SS_DOMAIN" --non-interactive || \
+                    echo -e "${YELLOW}[!] Не удалось удалить сертификат: certbot delete --cert-name $SS_DOMAIN${NC}"
+            fi
+        fi
+    fi
+
+    read -p "Удалить папку $SELFSTEAL_DIR (страница, ключи Reality)? (Y/n): " answer || answer=""
+    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+        rm -rf "$SELFSTEAL_DIR"
+    fi
+
+    echo -e "${GREEN}✅ Selfsteal удалён.${NC}"
+    echo -e "${YELLOW}    Не забудьте убрать inbound $SELFSTEAL_INBOUND_TAG и Host в панели,${NC}"
+    echo -e "${YELLOW}    иначе Xray будет проксировать «чужие» подключения в пустоту.${NC}"
+    pause_enter
+    return 0
+}
+
+selfsteal_menu() {
+    local choice
+    while true; do
+        clear
+        echo -e "${CYAN}================================================================${NC}"
+        echo -e "${GREEN}      Selfsteal SNI — Reality маскируется под свой домен      ${NC}"
+        echo -e "${CYAN}================================================================${NC}"
+        echo -e "  Xray слушает 443 и отдаёт «чужие» подключения локальному сайту"
+        echo -e "  с настоящим сертификатом Let's Encrypt домена этой ноды."
+        if selfsteal_load_env; then
+            echo -e "  Сейчас: ${GREEN}$SS_DOMAIN${NC} ($SS_WEBSERVER → 127.0.0.1:$SS_PORT)"
+        else
+            echo -e "  Сейчас: ${YELLOW}не установлено${NC}"
+        fi
+        echo -e "${CYAN}----------------------------------------------------------------${NC}"
+        echo -e "  ${YELLOW}1.${NC} Установить / переустановить сайт (Caddy или Nginx)"
+        echo -e "  ${YELLOW}2.${NC} Статус и проверка цепочки Xray → сайт"
+        echo -e "  ${YELLOW}3.${NC} Настройки для панели (inbound + Host)"
+        echo -e "  ${YELLOW}4.${NC} Удалить selfsteal"
+        echo -e "  ${YELLOW}0.${NC} Назад"
+        echo -e "${CYAN}================================================================${NC}"
+        read -p "Выберите действие (0-4): " choice || return 0
+        case $choice in
+            1) selfsteal_install ;;
+            2) selfsteal_status ;;
+            3) selfsteal_show_panel ;;
+            4) selfsteal_remove ;;
+            0) return 0 ;;
+            *) echo -e "${RED}Неверный ввод.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# Если скрипт прервали, пока selfsteal был остановлен, — запускаем его обратно
+trap 'selfsteal_resume' EXIT
+
 while true; do
     clear
     echo -e "${CYAN}"
@@ -1348,10 +2366,11 @@ while true; do
     echo -e "  ${YELLOW}6.${NC} Принудительно обновить SSL сертификаты"
     echo -e "  ${YELLOW}7.${NC} Переключить ветку обновлений (stable / dev)"
     echo -e "  ${YELLOW}8.${NC} Диагностика выпуска сертификата (без расхода лимитов)"
+    echo -e "  ${YELLOW}9.${NC} Selfsteal SNI для Reality (Caddy / Nginx)"
     echo -e "  ${YELLOW}0.${NC} Выход"
     echo -e "${CYAN}================================================================${NC}"
-    
-    read -p "Выберите действие (0-8): " choice
+
+    read -p "Выберите действие (0-9): " choice
     case $choice in
         1) install_node ;;
         2) setup_hysteria2 ;;
@@ -1361,12 +2380,13 @@ while true; do
         6) renew_certs ;;
         7) switch_branch ;;
         8) diagnose_acme ;;
-        0) 
+        9) selfsteal_menu ;;
+        0)
             echo -e "${GREEN}Выход. Хорошего дня!${NC}"
-            exit 0 
+            exit 0
             ;;
-        *) 
-            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 8.${NC}"
+        *)
+            echo -e "${RED}Неверный ввод. Пожалуйста, выберите от 0 до 9.${NC}"
             sleep 2 
             ;;
     esac
