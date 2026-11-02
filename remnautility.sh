@@ -1425,6 +1425,7 @@ selfsteal_resume() {
 
 selfsteal_load_env() {
     SS_DOMAIN=""; SS_WEBSERVER=""; SS_PORT=""; SS_EXTRA_SNI=""; SS_CADDYFILE=""; SS_CADDY_UNIT=""
+    SS_NGINX_SITE=""; SS_NGINX_LINK=""; SS_NGINX_UNIT=""
     [ -f "$SELFSTEAL_ENV" ] || return 1
     SS_DOMAIN=$(sed -n 's/^DOMAIN=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_WEBSERVER=$(sed -n 's/^WEBSERVER=//p' "$SELFSTEAL_ENV" | tail -n 1)
@@ -1432,6 +1433,9 @@ selfsteal_load_env() {
     SS_EXTRA_SNI=$(sed -n 's/^EXTRA_SNI=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_CADDYFILE=$(sed -n 's/^CADDYFILE=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_CADDY_UNIT=$(sed -n 's/^CADDY_UNIT=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_NGINX_SITE=$(sed -n 's/^NGINX_SITE=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_NGINX_LINK=$(sed -n 's/^NGINX_LINK=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_NGINX_UNIT=$(sed -n 's/^NGINX_UNIT=//p' "$SELFSTEAL_ENV" | tail -n 1)
     [ -n "$SS_DOMAIN" ] && [ -n "$SS_WEBSERVER" ] && [ -n "$SS_PORT" ]
 }
 
@@ -1445,6 +1449,9 @@ PORT=$SS_PORT
 EXTRA_SNI=$SS_EXTRA_SNI
 CADDYFILE=$SS_CADDYFILE
 CADDY_UNIT=$SS_CADDY_UNIT
+NGINX_SITE=$SS_NGINX_SITE
+NGINX_LINK=$SS_NGINX_LINK
+NGINX_UNIT=$SS_NGINX_UNIT
 EOF
 }
 
@@ -1454,6 +1461,7 @@ selfsteal_ws_label() {
         caddy)        echo "Caddy в Docker" ;;
         nginx)        echo "Nginx в Docker" ;;
         caddy-system) echo "системный Caddy" ;;
+        nginx-system) echo "системный nginx" ;;
         *)            echo "$1" ;;
     esac
 }
@@ -2059,22 +2067,364 @@ host_caddy_remove_block() {
     return 0
 }
 
+# --- Уже установленный в систему nginx -----------------------------------------
+# Чужие файлы не правим: свой сайт кладём отдельным файлом туда, откуда nginx уже
+# подключает конфиги (conf.d или sites-enabled). Сертификат — certbot через webroot:
+# nginx не останавливается ни при выпуске, ни при продлении.
+
+SELFSTEAL_NGINX_NAME="remnautility-selfsteal"
+
+# Версия $1 >= $2?
+ver_ge() {
+    [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]
+}
+
+# Порт, на котором selfsteal для домена $2 уже настроен в системном веб-сервере $1
+# (caddy-system: блок скрипта или ручной блок в Caddyfile; nginx-system: файл скрипта)
+selfsteal_host_port() {
+    local ws="$1" domain="$2"
+    case "$ws" in
+        caddy-system)
+            [ -f "$HC_CONFIG" ] || return 0
+            grep -oiE "https://${domain//./\\.}:[0-9]+" "$HC_CONFIG" 2>/dev/null | head -n 1 | sed 's/.*://' || true
+            ;;
+        nginx-system)
+            [ -f "$HN_SITE" ] || return 0
+            grep -oE '127\.0\.0\.1:[0-9]+ ssl' "$HN_SITE" 2>/dev/null | head -n 1 | sed -E 's/.*:([0-9]+) ssl/\1/' || true
+            ;;
+    esac
+    return 0
+}
+
+# Первый свободный локальный порт для сайта, начиная с 9443
+selfsteal_free_port() {
+    local p
+    for p in $(seq 9443 9499); do
+        if [ -z "$(port_listener_info "$p")" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo 9443
+}
+
+# Ищет системный nginx: мастер-процесс вне контейнеров либо сервис nginx.service.
+# Заполняет HN_PID, HN_UNIT, HN_BIN, HN_CONF, HN_RUNNING (0/1), HN_VER, HN_SITE (наш файл),
+# HN_LINK (симлинк в sites-enabled), HN_IPV6 (слушает ли кто-то [::]:80) и HN_PROBLEM.
+# Возвращает 1, если nginx в системе нет.
+detect_host_nginx() {
+    HN_PID=""; HN_UNIT=""; HN_BIN=""; HN_CONF=""; HN_RUNNING=0; HN_VER=""
+    HN_SITE=""; HN_LINK=""; HN_IPV6=0; HN_PROBLEM=""
+    local pid cmd="" exec_line dump prefix
+
+    for pid in $(pgrep -x nginx 2>/dev/null || true); do
+        if grep -qE 'docker|containerd|kubepods|libpod|lxc' "/proc/$pid/cgroup" 2>/dev/null; then
+            continue
+        fi
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        case "$cmd" in
+            *"master process"*) HN_PID=$pid; break ;;
+        esac
+    done
+
+    if [ -n "$HN_PID" ]; then
+        HN_RUNNING=1
+        HN_UNIT=$(grep -oE '[^/]+\.service$' "/proc/$HN_PID/cgroup" 2>/dev/null | head -n 1 || true)
+        HN_BIN=$(readlink -f "/proc/$HN_PID/exe" 2>/dev/null || true)
+        HN_BIN=${HN_BIN% (deleted)}
+        HN_CONF=$(echo "$cmd" | sed -n 's/.* -c \([^ ;]*\).*/\1/p')
+    elif command -v systemctl >/dev/null 2>&1 && systemctl cat nginx.service >/dev/null 2>&1; then
+        HN_UNIT="nginx.service"
+        exec_line=$(systemctl show -p ExecStart --value nginx.service 2>/dev/null \
+            | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | head -n 1 || true)
+        HN_BIN=$(echo "$exec_line" | awk '{print $1}')
+        HN_CONF=$(echo "$exec_line" | sed -n 's/.* -c \([^ ;]*\).*/\1/p')
+    else
+        return 1
+    fi
+
+    if [ -z "$HN_BIN" ] || [ ! -x "$HN_BIN" ]; then
+        HN_BIN=$(command -v nginx || true)
+    fi
+    if [ -z "$HN_BIN" ]; then
+        HN_PROBLEM="не найден исполняемый файл nginx"
+        return 0
+    fi
+    if [ -z "$HN_CONF" ]; then
+        HN_CONF=$("$HN_BIN" -V 2>&1 | grep -o -- '--conf-path=[^ ]*' | cut -d= -f2 || true)
+        HN_CONF=${HN_CONF:-/etc/nginx/nginx.conf}
+    fi
+    HN_VER=$("$HN_BIN" -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')
+
+    if ! dump=$("$HN_BIN" -T -c "$HN_CONF" 2>/dev/null); then
+        HN_PROBLEM="текущий конфиг nginx не проходит проверку (nginx -t) — сначала исправьте его"
+        return 0
+    fi
+    prefix=$(dirname "$HN_CONF")
+    if echo "$dump" | grep -qE "^[[:space:]]*include[[:space:]]+($prefix/)?conf\.d/\*\.conf[[:space:]]*;"; then
+        HN_SITE="$prefix/conf.d/$SELFSTEAL_NGINX_NAME.conf"
+    elif echo "$dump" | grep -qE "^[[:space:]]*include[[:space:]]+($prefix/)?sites-enabled/\*[[:space:]]*;"; then
+        HN_SITE="$prefix/sites-available/$SELFSTEAL_NGINX_NAME"
+        HN_LINK="$prefix/sites-enabled/$SELFSTEAL_NGINX_NAME"
+    else
+        HN_PROBLEM="в конфиге nginx нет подключения conf.d/*.conf или sites-enabled/* — некуда положить сайт"
+        return 0
+    fi
+    if echo "$dump" | grep -qE 'listen[[:space:]]+\[::\]:80([[:space:]]|;)'; then
+        HN_IPV6=1
+    fi
+    return 0
+}
+
+# Сайт selfsteal для системного nginx: $1 — домен, $2 — порт, $3=1 — с HTTPS-частью
+# (когда сертификат уже есть; до этого nginx нужен только для проверки Let's Encrypt)
+selfsteal_nginx_host_conf() {
+    local domain="$1" port="$2" with_ssl="$3"
+    echo "# remnautility selfsteal для VLESS Reality — файл создан скриптом, правки затрёт переустановка."
+    echo "# Xray на 443 отдаёт «чужие» подключения этому сайту. 80/tcp — сертификат и редирект,"
+    echo "# сам сайт слушает только 127.0.0.1:$port."
+    echo "server {"
+    echo "    listen 80;"
+    if [ "$HN_IPV6" = "1" ]; then echo "    listen [::]:80;"; fi
+    cat <<EOF
+    server_name $domain;
+    server_tokens off;
+
+    location /.well-known/acme-challenge/ {
+        root $SELFSTEAL_DIR/acme;
+    }
+    location / {
+        return 301 https://$domain\$request_uri;
+    }
+}
+EOF
+    [ "$with_ssl" = "1" ] || return 0
+    echo
+    echo "server {"
+    # «http2 on» появился в nginx 1.25.1, раньше HTTP/2 включался в listen
+    if ver_ge "${HN_VER:-0}" 1.25.1; then
+        echo "    listen 127.0.0.1:$port ssl;"
+        echo "    http2 on;"
+    else
+        echo "    listen 127.0.0.1:$port ssl http2;"
+    fi
+    cat <<EOF
+    server_name $domain;
+    server_tokens off;
+
+    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    root $SELFSTEAL_DIR/html;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+}
+
+# nginx -t. Ошибки — в HN_TEST_ERR.
+host_nginx_test() {
+    HN_TEST_ERR=$("$HN_BIN" -t -c "$HN_CONF" 2>&1) && return 0
+    HN_TEST_ERR=$(echo "$HN_TEST_ERR" | grep -iE 'emerg|error|failed' | tail -n 5)
+    return 1
+}
+
+# Перечитать конфиг без остановки (или запустить nginx, если он стоял)
+host_nginx_reload() {
+    if [ "$HN_RUNNING" != "1" ]; then
+        if [ -n "$HN_UNIT" ] && systemctl enable --now "$HN_UNIT" >/dev/null 2>&1; then
+            HN_RUNNING=1
+            return 0
+        fi
+        return 1
+    fi
+    if [ -n "$HN_UNIT" ] && systemctl reload "$HN_UNIT" >/dev/null 2>&1; then
+        return 0
+    fi
+    "$HN_BIN" -s reload -c "$HN_CONF" >/dev/null 2>&1
+}
+
+# Записать наш сайт (stdin) и включить его симлинком, если nginx берёт сайты из sites-enabled
+host_nginx_put_site() {
+    mkdir -p "$(dirname "$HN_SITE")"
+    cat > "$HN_SITE"
+    if [ -n "$HN_LINK" ]; then
+        mkdir -p "$(dirname "$HN_LINK")"
+        ln -sfn "$HN_SITE" "$HN_LINK"
+    fi
+}
+
+# Вернуть прежний вариант нашего сайта ($1 — его копия) или убрать сайт совсем
+host_nginx_restore() {
+    if [ -n "$1" ] && [ -f "$1" ]; then
+        cat "$1" > "$HN_SITE"
+        rm -f "$1"
+        if [ -n "$HN_LINK" ]; then ln -sfn "$HN_SITE" "$HN_LINK"; fi
+    else
+        rm -f "$HN_SITE"
+        if [ -n "$HN_LINK" ]; then rm -f "$HN_LINK"; fi
+    fi
+    if host_nginx_test; then
+        host_nginx_reload || true
+    fi
+    return 0
+}
+
+# Сертификат можно продлевать, не останавливая nginx (webroot или DNS)?
+cert_renews_without_port80() {
+    grep -qE '^authenticator[[:space:]]*=[[:space:]]*(webroot|dns-)' "/etc/letsencrypt/renewal/$1.conf" 2>/dev/null
+}
+
+# Встроить selfsteal в найденный nginx: свой сайт -> сертификат через webroot -> HTTPS.
+# При любой ошибке всё возвращается как было. $1 — домен, $2 — локальный порт.
+host_nginx_apply() {
+    local domain="$1" port="$2" prev="" answer need_cert=0 force=()
+    local hook="systemctl reload ${HN_UNIT:-nginx} >/dev/null 2>&1 || $HN_BIN -s reload >/dev/null 2>&1 || true"
+
+    # Тот же домен в другом server-блоке nginx не разведёт — сайт не заработает
+    if "$HN_BIN" -T -c "$HN_CONF" 2>/dev/null | awk -v a="$HN_SITE" -v b="$HN_LINK" -v d="$domain" '
+        /^# configuration file / { f = $4; sub(/:$/, "", f); next }
+        f != a && f != b && $1 == "server_name" {
+            for (i = 2; i <= NF; i++) { t = $i; sub(/;$/, "", t); if (tolower(t) == d) found = 1 }
+        }
+        END { exit (found ? 0 : 1) }'; then
+        echo -e "${RED}[!] Домен $domain уже указан в server_name другого сайта nginx.${NC}"
+        echo -e "${RED}    Уберите его оттуда (проверьте: nginx -T | grep -n $domain) и запустите установку снова.${NC}"
+        return 1
+    fi
+
+    mkdir -p "$SELFSTEAL_DIR/acme"
+    chmod 755 "$SELFSTEAL_DIR/acme"
+    if [ -f "$HN_SITE" ]; then
+        prev=$(mktemp)
+        cp -p "$HN_SITE" "$prev"
+    fi
+
+    if [ ! -f "/etc/letsencrypt/live/$domain/fullchain.pem" ] || [ ! -f "/etc/letsencrypt/live/$domain/privkey.pem" ]; then
+        need_cert=1
+    elif ! cert_renews_without_port80 "$domain"; then
+        # Выпущен в standalone-режиме: пока nginx держит 80/tcp, такой сертификат не продлится
+        echo -e "${YELLOW}[*] Сертификат $domain продлевается через standalone (нужен свободный 80/tcp) —${NC}"
+        echo -e "${YELLOW}    перевыпускаю через webroot, чтобы он продлевался при работающем nginx.${NC}"
+        need_cert=1
+        force=(--force-renewal)
+    else
+        echo -e "${GREEN}[*] ✅ Сертификат для $domain уже есть — использую его.${NC}"
+    fi
+
+    if [ "$need_cert" = "1" ]; then
+        # Шаг 1: только HTTP-часть — чтобы nginx отдал Let's Encrypt файл проверки
+        selfsteal_nginx_host_conf "$domain" "$port" 0 | host_nginx_put_site
+        if ! host_nginx_test; then
+            echo -e "${RED}[!] nginx не принимает конфиг сайта:${NC}"
+            echo "$HN_TEST_ERR" | sed 's/^/    /'
+            host_nginx_restore "$prev"
+            return 1
+        fi
+        if ! host_nginx_reload; then
+            echo -e "${RED}[!] Не удалось перечитать конфиг nginx.${NC}"
+            host_nginx_restore "$prev"
+            return 1
+        fi
+        # Самопроверка: отдаёт ли nginx файл проверки — иначе не тратим попытку Let's Encrypt
+        local probe_dir="$SELFSTEAL_DIR/acme/.well-known/acme-challenge" probe="remnautility-probe-$RANDOM" code="" tries=0
+        mkdir -p "$probe_dir"
+        chmod 755 "$SELFSTEAL_DIR/acme/.well-known" "$probe_dir"
+        echo ok > "$probe_dir/$probe"
+        chmod 644 "$probe_dir/$probe"
+        # reload у nginx асинхронный — ждём, пока новый конфиг начнёт отвечать (до ~10 с)
+        while [ "$tries" -lt 10 ]; do
+            sleep 1
+            code=$(curl -s -o /dev/null -w '%{http_code}' --noproxy "*" --max-time 5 \
+                -H "Host: $domain" "http://127.0.0.1/.well-known/acme-challenge/$probe" 2>/dev/null || true)
+            if [ "$code" = "200" ]; then break; fi
+            tries=$((tries + 1))
+        done
+        rm -f "$probe_dir/$probe"
+        if [ "$code" != "200" ]; then
+            echo -e "${RED}[!] nginx не отдаёт файл проверки Let's Encrypt (HTTP $code) — выпуск не пройдёт.${NC}"
+            if [ "$code" = "403" ]; then
+                echo -e "${YELLOW}    У nginx нет прав на чтение $SELFSTEAL_DIR/acme или каталогов выше.${NC}"
+            fi
+            selfsteal_show_errors /var/log/nginx/error.log
+            host_nginx_restore "$prev"
+            return 1
+        fi
+        echo -e "${GREEN}[*] Выпуск сертификата для $domain (webroot, nginx не останавливается)...${NC}"
+        if ! certbot certonly --webroot -w "$SELFSTEAL_DIR/acme" -d "$domain" --cert-name "$domain" \
+            --non-interactive --agree-tos --register-unsafely-without-email "${force[@]}" --deploy-hook "$hook"; then
+            echo -e "${RED}[!] Проверка по HTTP-01 (порт 80/tcp) не прошла.${NC}"
+            acme_failure_hints "$domain"
+            read -p "Выпустить через DNS-01 Cloudflare (открытые порты не нужны)? (y/n): " answer || answer=""
+            if [[ ! "$answer" =~ ^[Yy]$ ]] || ! issue_certificate_dns_cloudflare "$domain" "$hook"; then
+                host_nginx_restore "$prev"
+                return 1
+            fi
+        fi
+    fi
+
+    # Шаг 2: полный сайт с HTTPS на 127.0.0.1:$port
+    selfsteal_nginx_host_conf "$domain" "$port" 1 | host_nginx_put_site
+    if ! host_nginx_test; then
+        echo -e "${RED}[!] nginx не принимает конфиг сайта:${NC}"
+        echo "$HN_TEST_ERR" | sed 's/^/    /'
+        host_nginx_restore "$prev"
+        return 1
+    fi
+    if ! host_nginx_reload; then
+        echo -e "${RED}[!] Не удалось перечитать конфиг nginx.${NC}"
+        host_nginx_restore "$prev"
+        return 1
+    fi
+    rm -f "$prev"
+    echo -e "${GREEN}[*] Сайт добавлен: $HN_SITE${HN_LINK:+ (включён через $HN_LINK)}, nginx перечитал конфиг.${NC}"
+    ensure_certbot_renew_timer
+    return 0
+}
+
+# Убрать наш сайт из системного nginx (при удалении или смене режима)
+host_nginx_remove_site() {
+    local site="$SS_NGINX_SITE" link="$SS_NGINX_LINK"
+    detect_host_nginx || true
+    site=${site:-$HN_SITE}
+    link=${link:-$HN_LINK}
+    if [ -z "$site" ] || { [ ! -e "$site" ] && [ ! -L "${link:-/nonexistent}" ]; }; then
+        return 0
+    fi
+    rm -f "$site"
+    if [ -n "$link" ]; then rm -f "$link"; fi
+    if [ -n "$HN_BIN" ] && host_nginx_test && host_nginx_reload; then
+        echo -e "${GREEN}[*] Сайт selfsteal убран из nginx, nginx перечитал конфиг.${NC}"
+    else
+        echo -e "${YELLOW}[!] Файл сайта удалён, но nginx не перечитал конфиг: nginx -t && systemctl reload nginx${NC}"
+    fi
+    return 0
+}
+
 # HTTP-код сайта на 127.0.0.1:$2 с SNI $1 и проверкой сертификата (000 — TLS не прошёл)
 selfsteal_local_check() {
     curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null || true
+        --noproxy "*" --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null || true
 }
 
 # Версия HTTP при TLS 1.3 + HTTP/2 ("2" — сайт годится как target для Reality)
 selfsteal_h2_tls13() {
     curl -s -o /dev/null -w '%{http_version}' --http2 --tlsv1.3 --max-time 5 \
-        --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null || true
+        --noproxy "*" --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null || true
 }
 
+# Ждём HTTP 200 от сайта. Последний код ответа — в SS_LAST_CODE.
 selfsteal_wait_ready() {
     local domain="$1" port="$2" timeout="$3" waited=0
+    SS_LAST_CODE=""
     while [ "$waited" -lt "$timeout" ]; do
-        if [ "$(selfsteal_local_check "$domain" "$port")" = "200" ]; then
+        SS_LAST_CODE=$(selfsteal_local_check "$domain" "$port")
+        if [ "$SS_LAST_CODE" = "200" ]; then
             echo
             return 0
         fi
@@ -2086,10 +2436,12 @@ selfsteal_wait_ready() {
     return 1
 }
 
-# Ошибки из логов (выдача сертификата, конфиг): $1 — контейнер или сервис *.service
+# Ошибки из логов (выдача сертификата, конфиг): $1 — контейнер, сервис *.service или файл лога
 selfsteal_show_errors() {
     [ -n "$1" ] || return 0
-    if [[ "$1" == *.service ]]; then
+    if [[ "$1" == /* ]]; then
+        tail -n 300 "$1" 2>/dev/null | grep -iE 'emerg|crit|error' | tail -n 12 | sed 's/^/    /' || true
+    elif [[ "$1" == *.service ]]; then
         journalctl -u "$1" --since "-15 min" --no-pager 2>/dev/null \
             | grep -iE 'error|fail|challenge' | tail -n 12 | sed 's/^/    /' || true
     else
@@ -2104,9 +2456,10 @@ listeners_only_pid() {
 }
 
 # Проверки перед установкой. Возвращает 1, если пользователь решил не продолжать.
-# $3 — PID системного Caddy, в который встраиваемся: его порты — не помеха.
+# $3 — PID системного веб-сервера, в который встраиваемся, $4 — его имя: его 80/tcp — не помеха.
+# $5=1 — локальный порт уже занят прежним selfsteal этого веб-сервера, его можно заменить.
 selfsteal_preflight() {
-    local domain="$1" port="$2" own_pid="${3:-}" server_ip domain_ip busy answer problems=0
+    local domain="$1" port="$2" own_pid="${3:-}" own_name="${4:-веб-сервер}" reuse_port="${5:-0}" server_ip domain_ip busy answer problems=0
     local node_compose="/opt/remnanode/docker-compose.yml"
     echo -e "\n${CYAN}[*] Проверка перед установкой...${NC}"
 
@@ -2130,7 +2483,7 @@ selfsteal_preflight() {
 
     busy=$(port_listener_info 80)
     if listeners_only_pid "$busy" "$own_pid"; then
-        echo -e "${GREEN}[*] ✅ Порт 80/tcp держит этот Caddy — он и получит сертификат.${NC}"
+        echo -e "${GREEN}[*] ✅ Порт 80/tcp держит этот $own_name — он и получит сертификат.${NC}"
     elif [ -n "$busy" ]; then
         echo -e "${RED}[!] Порт 80/tcp занят — он нужен сайту для получения сертификата:${NC}"
         echo "$busy" | sed 's/^/    /'
@@ -2144,12 +2497,16 @@ selfsteal_preflight() {
         echo -e "${GREEN}[*] ✅ Порт 80/tcp свободен.${NC}"
     fi
 
+    # Занятый порт годится, только если на нём уже selfsteal этого же веб-сервера ($5=1)
     busy=$(port_listener_info "$port")
-    if listeners_only_pid "$busy" "$own_pid"; then
-        echo -e "${CYAN}[*] Порт $port уже держит этот Caddy (видимо, selfsteal настроен ранее) — заменю настройку.${NC}"
+    if [ "$reuse_port" = "1" ] && listeners_only_pid "$busy" "$own_pid"; then
+        echo -e "${CYAN}[*] На порту $port уже selfsteal этого $own_name — заменю его настройку.${NC}"
     elif [ -n "$busy" ]; then
         echo -e "${RED}[!] Порт $port занят — выберите другой локальный порт:${NC}"
         echo "$busy" | sed 's/^/    /'
+        if listeners_only_pid "$busy" "$own_pid"; then
+            echo -e "${YELLOW}    Его держит другой сайт этого $own_name — трогать его нельзя.${NC}"
+        fi
         problems=1
     fi
 
@@ -2198,20 +2555,43 @@ selfsteal_install() {
         echo -e "${RED}[!] Некорректный домен: '$domain'.${NC}"
     done
 
-    # Уже установленный в систему Caddy: встраиваемся в него, а не ставим второй веб-сервер
-    local ws="" ws_choice ws_default=1 answer state
+    # Уже установленный в систему Caddy или nginx: встраиваемся в него, а не ставим
+    # второй веб-сервер (80/tcp у сервера один)
+    local ws="" ws_choice ws_default=1 answer state hc_ok=0 hn_ok=0
     if detect_host_caddy; then
         if [ -n "$HC_PROBLEM" ]; then
             echo -e "\n${YELLOW}[!] На сервере уже есть Caddy${HC_UNIT:+ ($HC_UNIT)}, но встроить selfsteal в него нельзя:${NC}"
             echo -e "${YELLOW}    $HC_PROBLEM.${NC}"
         else
-            if [ "$HC_RUNNING" = "1" ]; then state="работает"; else state="остановлен"; fi
-            echo -e "\n${GREEN}[*] Найден установленный Caddy: ${HC_UNIT:-процесс $HC_PID} ($state), конфиг $HC_CONFIG${NC}"
-            echo -e "    Selfsteal можно добавить в него отдельным блоком: остальные сайты в конфиге"
-            echo -e "    не трогаются, Caddy перечитает настройки без остановки."
-            read -p "Встроить selfsteal в этот Caddy? (Y/n): " answer || return 0
-            if [[ ! "$answer" =~ ^[Nn]$ ]]; then ws="caddy-system"; fi
+            hc_ok=1
         fi
+    fi
+    if detect_host_nginx; then
+        if [ -n "$HN_PROBLEM" ]; then
+            echo -e "\n${YELLOW}[!] На сервере уже есть nginx${HN_UNIT:+ ($HN_UNIT)}, но встроить selfsteal в него нельзя:${NC}"
+            echo -e "${YELLOW}    $HN_PROBLEM.${NC}"
+        else
+            hn_ok=1
+        fi
+    fi
+    # Есть оба — предлагаем тот, что работает
+    if [ "$hc_ok" = "1" ] && [ "$hn_ok" = "1" ]; then
+        if [ "$HN_RUNNING" = "1" ] && [ "$HC_RUNNING" != "1" ]; then hc_ok=0; else hn_ok=0; fi
+    fi
+    if [ "$hc_ok" = "1" ]; then
+        if [ "$HC_RUNNING" = "1" ]; then state="работает"; else state="остановлен"; fi
+        echo -e "\n${GREEN}[*] Найден установленный Caddy: ${HC_UNIT:-процесс $HC_PID} ($state), конфиг $HC_CONFIG${NC}"
+        echo -e "    Selfsteal можно добавить в него отдельным блоком: остальные сайты в конфиге"
+        echo -e "    не трогаются, Caddy перечитает настройки без остановки."
+        read -p "Встроить selfsteal в этот Caddy? (Y/n): " answer || return 0
+        if [[ ! "$answer" =~ ^[Nn]$ ]]; then ws="caddy-system"; fi
+    elif [ "$hn_ok" = "1" ]; then
+        if [ "$HN_RUNNING" = "1" ]; then state="работает"; else state="остановлен"; fi
+        echo -e "\n${GREEN}[*] Найден установленный nginx ${HN_VER}: ${HN_UNIT:-процесс $HN_PID} ($state), конфиг $HN_CONF${NC}"
+        echo -e "    Selfsteal можно добавить в него отдельным файлом ($HN_SITE): остальные сайты"
+        echo -e "    не трогаются, сертификат выпускается без остановки nginx."
+        read -p "Встроить selfsteal в этот nginx? (Y/n): " answer || return 0
+        if [[ ! "$answer" =~ ^[Nn]$ ]]; then ws="nginx-system"; fi
     fi
 
     if [ -z "$ws" ]; then
@@ -2234,10 +2614,20 @@ selfsteal_install() {
         esac
     fi
 
-    local port
+    # По умолчанию — порт, где selfsteal для домена уже настроен в системном веб-сервере,
+    # затем прежний порт скрипта, иначе первый свободный начиная с 9443
+    local port host_port port_default
+    host_port=$(selfsteal_host_port "$ws" "$domain")
+    port_default=${host_port:-$old_port}
+    if [ -z "$port_default" ]; then
+        port_default=$(selfsteal_free_port)
+        if [ "$port_default" != "9443" ]; then
+            echo -e "${CYAN}[*] Порт 9443 уже занят — предлагаю свободный $port_default.${NC}"
+        fi
+    fi
     while true; do
-        read -p "Локальный порт сайта на 127.0.0.1 [${old_port:-9443}]: " port || return 0
-        port=${port:-${old_port:-9443}}
+        read -p "Локальный порт сайта на 127.0.0.1 [$port_default]: " port || return 0
+        port=${port:-$port_default}
         if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; then break; fi
         echo -e "${RED}[!] Нужен номер порта от 1024 до 65535.${NC}"
     done
@@ -2267,9 +2657,12 @@ selfsteal_install() {
 
     # Прежний сайт-контейнер держит 80/tcp и локальный порт — останавливаем на время проверок
     selfsteal_pause
-    local own_pid=""
-    if [ "$ws" = "caddy-system" ] && [ "$HC_RUNNING" = "1" ]; then own_pid=$HC_PID; fi
-    if ! selfsteal_preflight "$domain" "$port" "$own_pid"; then
+    local own_pid="" own_name="" reuse_port=0
+    # Занятый порт можно переиспользовать, только если там уже selfsteal этого веб-сервера
+    if [ -n "$host_port" ] && [ "$port" = "$host_port" ]; then reuse_port=1; fi
+    if [ "$ws" = "caddy-system" ] && [ "$HC_RUNNING" = "1" ]; then own_pid=$HC_PID; own_name="Caddy"; fi
+    if [ "$ws" = "nginx-system" ] && [ "$HN_RUNNING" = "1" ]; then own_pid=$HN_PID; own_name="nginx"; fi
+    if ! selfsteal_preflight "$domain" "$port" "$own_pid" "$own_name" "$reuse_port"; then
         echo -e "${YELLOW}[*] Установка отменена.${NC}"
         selfsteal_resume
         pause_enter
@@ -2294,8 +2687,13 @@ selfsteal_install() {
             fi
         fi
     fi
+    if [ "$ws" = "nginx-system" ] && ! ensure_certbot; then
+        selfsteal_resume
+        pause_enter
+        return 0
+    fi
 
-    # Страница-заглушка. Системный Caddy работает от своего пользователя — нужен доступ на чтение.
+    # Страница-заглушка. Системные Caddy и nginx работают от своего пользователя — нужен доступ на чтение.
     mkdir -p "$SELFSTEAL_DIR/html"
     if [ -n "$tpl" ]; then
         selfsteal_write_site "$SELFSTEAL_DIR/html" "$domain" "$tpl"
@@ -2303,17 +2701,21 @@ selfsteal_install() {
     chmod 755 "$SELFSTEAL_DIR" "$SELFSTEAL_DIR/html"
     chmod -R a+rX "$SELFSTEAL_DIR/html"
 
-    if [ "$ws" = "caddy-system" ]; then
-        if ! host_caddy_apply "$domain" "$port"; then
-            echo -e "${RED}[!] Selfsteal в Caddy не добавлен, его конфиг не изменён.${NC}"
-            selfsteal_resume
-            pause_enter
-            return 0
-        fi
-    elif [ "$old_ws" = "caddy-system" ]; then
-        # Переезд из системного Caddy в контейнер — убираем свой блок из его конфига
-        host_caddy_remove_block
+    if [ "$ws" = "caddy-system" ] && ! host_caddy_apply "$domain" "$port"; then
+        echo -e "${RED}[!] Selfsteal в Caddy не добавлен, его конфиг не изменён.${NC}"
+        selfsteal_resume
+        pause_enter
+        return 0
     fi
+    if [ "$ws" = "nginx-system" ] && ! host_nginx_apply "$domain" "$port"; then
+        echo -e "${RED}[!] Selfsteal в nginx не добавлен, его конфиг не изменён.${NC}"
+        selfsteal_resume
+        pause_enter
+        return 0
+    fi
+    # Смена режима — убираем свою настройку из прежнего системного веб-сервера
+    if [ "$old_ws" = "caddy-system" ] && [ "$ws" != "caddy-system" ]; then host_caddy_remove_block; fi
+    if [ "$old_ws" = "nginx-system" ] && [ "$ws" != "nginx-system" ]; then host_nginx_remove_site; fi
 
     # Прежние контейнеры убираем (смена Caddy <-> Nginx или переезд в системный Caddy)
     local c
@@ -2328,13 +2730,18 @@ selfsteal_install() {
     fi
     SELFSTEAL_PAUSED=""
 
-    SS_DOMAIN=$domain; SS_WEBSERVER=$ws; SS_PORT=$port; SS_CADDYFILE=""; SS_CADDY_UNIT=""
+    SS_DOMAIN=$domain; SS_WEBSERVER=$ws; SS_PORT=$port
+    SS_CADDYFILE=""; SS_CADDY_UNIT=""; SS_NGINX_SITE=""; SS_NGINX_LINK=""; SS_NGINX_UNIT=""
     if [ "$domain" = "$old_domain" ]; then SS_EXTRA_SNI=$old_extra; else SS_EXTRA_SNI=""; fi
 
-    if [ "$ws" = "caddy-system" ]; then
-        SS_CADDYFILE=$HC_CONFIG; SS_CADDY_UNIT=$HC_UNIT
+    if [ "$ws" = "caddy-system" ] || [ "$ws" = "nginx-system" ]; then
+        if [ "$ws" = "caddy-system" ]; then
+            SS_CADDYFILE=$HC_CONFIG; SS_CADDY_UNIT=$HC_UNIT
+        else
+            SS_NGINX_SITE=$HN_SITE; SS_NGINX_LINK=$HN_LINK; SS_NGINX_UNIT=$HN_UNIT
+        fi
         rm -f "$SELFSTEAL_DIR/docker-compose.yml" "$SELFSTEAL_DIR/Caddyfile" "$SELFSTEAL_DIR/nginx.conf"
-        # Хуки останавливали контейнеры скрипта — системный Caddy они не трогают, они больше не нужны
+        # Хуки останавливали контейнеры скрипта — системный веб-сервер они не трогают, они не нужны
         selfsteal_remove_renew_hooks
         selfsteal_save_env
     else
@@ -2363,7 +2770,8 @@ selfsteal_install() {
 
     local logsrc="selfsteal-$ws" timeout=20
     if [ "$ws" = "caddy-system" ]; then logsrc=$HC_UNIT; fi
-    if [ "$ws" = "nginx" ]; then
+    if [ "$ws" = "nginx-system" ]; then logsrc="/var/log/nginx/error.log"; fi
+    if [ "$ws" = "nginx" ] || [ "$ws" = "nginx-system" ]; then
         echo -ne "${CYAN}[*] Жду ответа сайта${NC}"
     else
         timeout=150
@@ -2377,7 +2785,13 @@ selfsteal_install() {
             echo -e "${YELLOW}[!] Не удалось подтвердить TLS 1.3 + HTTP/2 — Reality требует оба.${NC}"
         fi
     else
-        echo -e "${RED}[!] За ${timeout} с сайт не ответил с валидным сертификатом. Ошибки из лога:${NC}"
+        echo -e "${RED}[!] За ${timeout} с сайт не ответил с валидным сертификатом (последний ответ: HTTP ${SS_LAST_CODE:-000}).${NC}"
+        case "$SS_LAST_CODE" in
+            403) echo -e "${YELLOW}    403 — у веб-сервера нет прав на чтение $SELFSTEAL_DIR/html (или каталогов выше).${NC}" ;;
+            404) echo -e "${YELLOW}    404 — в $SELFSTEAL_DIR/html нет index.html.${NC}" ;;
+            000|"") echo -e "${YELLOW}    000 — сайт не слушает порт или сертификат ещё не получен.${NC}" ;;
+        esac
+        echo -e "${YELLOW}    Ошибки из лога:${NC}"
         selfsteal_show_errors "$logsrc"
         case "$ws" in
             caddy)
@@ -2389,6 +2803,9 @@ selfsteal_install() {
                 echo -e "${YELLOW}    Caddy будет повторять попытки сам. Частая причина — недоступен 80/tcp снаружи.${NC}"
                 echo -e "${YELLOW}    Проверьте с другого сервера: curl -I http://$domain/ — должен прийти ответ 301.${NC}"
                 ;;
+            nginx-system)
+                echo -e "${YELLOW}    Проверьте: nginx -t и tail /var/log/nginx/error.log${NC}"
+                ;;
         esac
         echo -e "${YELLOW}    Проверить позже: пункт 2 этого меню.${NC}"
     fi
@@ -2397,6 +2814,10 @@ selfsteal_install() {
     if [ "$ws" = "caddy-system" ]; then
         echo -e "${GREEN}✅ Selfsteal встроен в системный Caddy: $domain → 127.0.0.1:$port${NC}"
         echo -e "    Блок между метками «remnautility selfsteal» в $HC_CONFIG — остальное не тронуто."
+    elif [ "$ws" = "nginx-system" ]; then
+        echo -e "${GREEN}✅ Selfsteal встроен в системный nginx: $domain → 127.0.0.1:$port${NC}"
+        echo -e "    Отдельный файл $HN_SITE — остальные сайты nginx не тронуты."
+        echo -e "    Сертификат продлевает certbot без остановки nginx."
     else
         echo -e "${GREEN}✅ Selfsteal-сайт установлен: $(selfsteal_ws_label "$ws"), $domain → 127.0.0.1:$port${NC}"
     fi
@@ -2546,6 +2967,9 @@ selfsteal_status() {
     if [ "$SS_WEBSERVER" = "caddy-system" ]; then
         logsrc=$SS_CADDY_UNIT
         echo -e "  Веб-сервер:  системный Caddy (${SS_CADDY_UNIT:-без systemd}, $SS_CADDYFILE)"
+    elif [ "$SS_WEBSERVER" = "nginx-system" ]; then
+        logsrc="/var/log/nginx/error.log"
+        echo -e "  Веб-сервер:  системный nginx (${SS_NGINX_UNIT:-без systemd}, $SS_NGINX_SITE)"
     else
         echo -e "  Веб-сервер:  $(selfsteal_ws_label "$SS_WEBSERVER") (контейнер $container)"
     fi
@@ -2571,6 +2995,29 @@ selfsteal_status() {
             echo -e "${GREEN}[*] ✅ Блок selfsteal есть в $SS_CADDYFILE.${NC}"
         else
             echo -e "${RED}[!] В ${SS_CADDYFILE:-Caddyfile} нет блока selfsteal — переустановите (пункт 1).${NC}"
+        fi
+    elif [ "$SS_WEBSERVER" = "nginx-system" ]; then
+        state=""
+        if [ -n "$SS_NGINX_UNIT" ] && systemctl is-active --quiet "$SS_NGINX_UNIT" 2>/dev/null; then
+            state="running"
+        elif detect_host_nginx && [ "$HN_RUNNING" = "1" ]; then
+            state="running"
+        fi
+        if [ "$state" = "running" ]; then
+            echo -e "${GREEN}[*] ✅ nginx работает.${NC}"
+        else
+            echo -e "${RED}[!] nginx не запущен. Запуск: systemctl start ${SS_NGINX_UNIT:-nginx}${NC}"
+        fi
+        if [ -f "$SS_NGINX_SITE" ] && { [ -z "$SS_NGINX_LINK" ] || [ -L "$SS_NGINX_LINK" ]; }; then
+            echo -e "${GREEN}[*] ✅ Сайт selfsteal подключён: $SS_NGINX_SITE${NC}"
+        else
+            echo -e "${RED}[!] Сайт selfsteal не подключён к nginx (${SS_NGINX_LINK:-$SS_NGINX_SITE}) — переустановите (пункт 1).${NC}"
+        fi
+        if cert_renews_without_port80 "$SS_DOMAIN"; then
+            echo -e "${GREEN}[*] ✅ Сертификат продлевается без остановки nginx (webroot).${NC}"
+        else
+            echo -e "${YELLOW}[!] Сертификат продлевается через standalone — пока nginx держит 80/tcp, продление${NC}"
+            echo -e "${YELLOW}    не пройдёт. Переустановите selfsteal (пункт 1): скрипт перевыпустит его через webroot.${NC}"
         fi
     else
         state=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)
@@ -2632,7 +3079,7 @@ selfsteal_status() {
         fi
         # Полная цепочка: клиент → Xray(443) → сайт. Так же увидит сайт браузер.
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
-            --resolve "$SS_DOMAIN:443:127.0.0.1" "https://$SS_DOMAIN/" 2>/dev/null || true)
+            --noproxy "*" --resolve "$SS_DOMAIN:443:127.0.0.1" "https://$SS_DOMAIN/" 2>/dev/null || true)
         if [ "$code" = "200" ]; then
             echo -e "${GREEN}[*] ✅ Цепочка работает: https://$SS_DOMAIN через Xray (443) отдаёт заглушку.${NC}"
         else
@@ -2643,8 +3090,8 @@ selfsteal_status() {
         fi
     fi
 
-    # Хуки certbot нужны только контейнерам скрипта: системный Caddy они не останавливают
-    if [ "$SS_WEBSERVER" != "caddy-system" ]; then
+    # Хуки certbot нужны только контейнерам скрипта: системные веб-серверы они не останавливают
+    if [ "$SS_WEBSERVER" = "caddy" ] || [ "$SS_WEBSERVER" = "nginx" ]; then
         if [ -x "/etc/letsencrypt/renewal-hooks/pre/$SELFSTEAL_HOOK" ]; then
             echo -e "${GREEN}[*] ✅ Хуки certbot на месте: при продлении сертификатов сайт освобождает 80/tcp.${NC}"
         else
@@ -2674,6 +3121,10 @@ selfsteal_remove() {
         # Сам Caddy и остальные его сайты не трогаем — убираем только свой блок
         host_caddy_remove_block
     fi
+    if [ "$SS_WEBSERVER" = "nginx-system" ]; then
+        # Сам nginx и остальные его сайты не трогаем — убираем только свой файл
+        host_nginx_remove_site
+    fi
     if [ "$SS_WEBSERVER" = "caddy" ]; then
         read -p "Удалить и том с сертификатами Caddy (caddy-data)? (y/N): " answer || answer=""
         if [[ "$answer" =~ ^[Yy]$ ]]; then down_args+=(-v); fi
@@ -2688,9 +3139,11 @@ selfsteal_remove() {
     fi
     selfsteal_remove_renew_hooks
 
-    if [ "$SS_WEBSERVER" = "nginx" ] && [ -n "$SS_DOMAIN" ] && [ -d "/etc/letsencrypt/live/$SS_DOMAIN" ]; then
+    if { [ "$SS_WEBSERVER" = "nginx" ] || [ "$SS_WEBSERVER" = "nginx-system" ]; } && [ -n "$SS_DOMAIN" ] && [ -d "/etc/letsencrypt/live/$SS_DOMAIN" ]; then
         if grep -qs "/etc/letsencrypt/live/$SS_DOMAIN/" /opt/remnanode/docker-compose.yml; then
             echo -e "${CYAN}[*] Сертификат $SS_DOMAIN использует нода (Hysteria2) — оставляю его.${NC}"
+        elif command -v nginx >/dev/null 2>&1 && nginx -T 2>/dev/null | grep -qF "/etc/letsencrypt/live/$SS_DOMAIN/"; then
+            echo -e "${CYAN}[*] Сертификат $SS_DOMAIN использует другой сайт nginx — оставляю его.${NC}"
         else
             read -p "Удалить и сертификат certbot для $SS_DOMAIN? (y/N): " answer || answer=""
             if [[ "$answer" =~ ^[Yy]$ ]]; then
@@ -2727,7 +3180,7 @@ selfsteal_menu() {
             echo -e "  Сейчас: ${YELLOW}не установлено${NC}"
         fi
         echo -e "${CYAN}----------------------------------------------------------------${NC}"
-        echo -e "  ${YELLOW}1.${NC} Установить / переустановить (Caddy, Nginx или уже установленный Caddy)"
+        echo -e "  ${YELLOW}1.${NC} Установить / переустановить (Caddy, Nginx или уже установленные Caddy/nginx)"
         echo -e "  ${YELLOW}2.${NC} Статус и проверка цепочки Xray → сайт"
         echo -e "  ${YELLOW}3.${NC} Настройки для панели (inbound + Host)"
         echo -e "  ${YELLOW}4.${NC} Удалить selfsteal"
