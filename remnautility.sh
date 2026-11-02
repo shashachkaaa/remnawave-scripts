@@ -231,33 +231,33 @@ resolve_domain_ip() {
     fi
 }
 
-# Открыть порт $1/tcp в управляемом файрволе (ufw / firewalld) — с подтверждением.
-# $2 — зачем нужен порт (для пояснения пользователю)
+# Открыть порт $1 в управляемом файрволе (ufw / firewalld) — с подтверждением.
+# $2 — зачем нужен порт (для пояснения пользователю), $3 — протокол: tcp (по умолчанию) или udp
 firewall_allow_port() {
-    local port="$1" why="$2" answer
+    local port="$1" why="$2" proto="${3:-tcp}" answer
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ufw status 2>/dev/null | grep -qE "^${port}(/tcp)?[[:space:]]+ALLOW"; then
-            echo -e "${GREEN}[*] ufw активен, ${port}/tcp уже разрешён.${NC}"
+        if ufw status 2>/dev/null | grep -qE "^${port}(/${proto})?[[:space:]]+ALLOW"; then
+            echo -e "${GREEN}[*] ufw активен, ${port}/${proto} уже разрешён.${NC}"
         else
-            echo -e "${YELLOW}[!] ufw активен, но правила для ${port}/tcp нет — ${why}.${NC}"
-            read -p "Открыть ${port}/tcp в ufw? (y/n): " answer
+            echo -e "${YELLOW}[!] ufw активен, но правила для ${port}/${proto} нет — ${why}.${NC}"
+            read -p "Открыть ${port}/${proto} в ufw? (y/n): " answer
             if [[ "$answer" =~ ^[Yy]$ ]]; then
-                ufw allow "${port}/tcp" >/dev/null 2>&1 && echo -e "${GREEN}[*] ufw: ${port}/tcp открыт.${NC}"
+                ufw allow "${port}/${proto}" >/dev/null 2>&1 && echo -e "${GREEN}[*] ufw: ${port}/${proto} открыт.${NC}"
             fi
         fi
         return 0
     fi
 
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        if firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
-            echo -e "${GREEN}[*] firewalld активен, ${port}/tcp уже разрешён.${NC}"
+        if firewall-cmd --query-port="${port}/${proto}" >/dev/null 2>&1; then
+            echo -e "${GREEN}[*] firewalld активен, ${port}/${proto} уже разрешён.${NC}"
         else
-            echo -e "${YELLOW}[!] firewalld активен, ${port}/tcp закрыт — ${why}.${NC}"
-            read -p "Открыть ${port}/tcp в firewalld? (y/n): " answer
+            echo -e "${YELLOW}[!] firewalld активен, ${port}/${proto} закрыт — ${why}.${NC}"
+            read -p "Открыть ${port}/${proto} в firewalld? (y/n): " answer
             if [[ "$answer" =~ ^[Yy]$ ]]; then
-                firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
+                firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
                 firewall-cmd --reload >/dev/null 2>&1
-                echo -e "${GREEN}[*] firewalld: ${port}/tcp открыт.${NC}"
+                echo -e "${GREEN}[*] firewalld: ${port}/${proto} открыт.${NC}"
             fi
         fi
         return 0
@@ -265,9 +265,9 @@ firewall_allow_port() {
 
     # Голый iptables/nftables не трогаем автоматически — только предупреждаем
     if iptables -S INPUT 2>/dev/null | head -n 1 | grep -q -- "-P INPUT DROP"; then
-        if ! iptables -S INPUT 2>/dev/null | grep -qE -- "--dport ${port} .*-j (ACCEPT|RETURN)"; then
-            echo -e "${YELLOW}[!] Политика iptables INPUT = DROP, явного правила для ${port}/tcp нет.${NC}"
-            echo -e "${YELLOW}    Откройте порт вручную: iptables -I INPUT -p tcp --dport ${port} -j ACCEPT${NC}"
+        if ! iptables -S INPUT 2>/dev/null | grep -qE -- "-p ${proto} .*--dport ${port} .*-j (ACCEPT|RETURN)"; then
+            echo -e "${YELLOW}[!] Политика iptables INPUT = DROP, явного правила для ${port}/${proto} нет.${NC}"
+            echo -e "${YELLOW}    Откройте порт вручную: iptables -I INPUT -p ${proto} --dport ${port} -j ACCEPT${NC}"
         fi
     fi
     return 0
@@ -458,9 +458,146 @@ install_node() {
     read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
+# --- Сертификат Caddy для Hysteria2 --------------------------------------------
+# Если на ноде selfsteal на Caddy, сертификат для домена ноды у Caddy уже есть,
+# и продлевает его тоже Caddy. Hysteria2 отдаём копию: certbot и 80/tcp не нужны.
+# Копию держим в $NODE_PATH/ssl (каталог монтируется в ноду целиком: при замене файлов
+# одиночный bind-mount файла остался бы на старом inode), сверяем раз в сутки таймером.
+
+HYST_SYNC_BIN="/usr/local/bin/remnautility-hysteria-cert-sync"
+HYST_SYNC_UNIT="remnautility-hysteria-cert-sync"
+
+# Текст скрипта синхронизации: $1 — домен, $2 — каталог копии, $3 — compose-файл ноды.
+# С ключом --find только печатает путь к сертификату Caddy, --no-restart — не трогает ноду.
+hysteria_sync_script() {
+    cat <<EOF
+#!/bin/sh
+# remnautility: сертификат для Hysteria2 выпускает и продлевает Caddy (selfsteal).
+# Копирует актуальный сертификат в каталог ноды и, если он изменился, перезапускает ноду.
+# Запускается таймером $HYST_SYNC_UNIT.timer.
+DOMAIN="$1"
+DEST="$2"
+COMPOSE="$3"
+EOF
+    cat <<'EOF'
+
+# Где Caddy хранит данные: системный (пользователь caddy или root) и Docker-тома
+roots="/var/lib/caddy/.local/share/caddy /root/.local/share/caddy"
+for d in /var/lib/docker/volumes/*/_data/caddy; do roots="$roots $d"; done
+if command -v docker >/dev/null 2>&1; then
+    for v in $(docker volume ls -q 2>/dev/null | grep -i caddy); do
+        mp=$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null)
+        [ -n "$mp" ] && roots="$roots $mp/caddy"
+    done
+fi
+
+# Самый свежий боевой (не staging) сертификат домена
+src=""
+for r in $roots; do
+    for f in "$r"/certificates/*/"$DOMAIN"/"$DOMAIN".crt; do
+        [ -f "$f" ] && [ -f "${f%.crt}.key" ] || continue
+        case "$f" in *staging*) continue ;; esac
+        if [ -z "$src" ] || [ "$f" -nt "$src" ]; then src=$f; fi
+    done
+done
+
+if [ "$1" = "--find" ]; then
+    echo "$src"
+    exit 0
+fi
+if [ -z "$src" ]; then
+    echo "remnautility: сертификат Caddy для $DOMAIN не найден" >&2
+    exit 1
+fi
+
+mkdir -p "$DEST"
+if cmp -s "$src" "$DEST/cert.pem" && cmp -s "${src%.crt}.key" "$DEST/cert.key"; then
+    exit 0
+fi
+cp "$src" "$DEST/cert.pem.tmp" && cp "${src%.crt}.key" "$DEST/cert.key.tmp" || exit 1
+chmod 644 "$DEST/cert.pem.tmp"
+chmod 600 "$DEST/cert.key.tmp"
+mv -f "$DEST/cert.pem.tmp" "$DEST/cert.pem"
+mv -f "$DEST/cert.key.tmp" "$DEST/cert.key"
+echo "remnautility: сертификат $DOMAIN обновлён из $src"
+
+if [ "$1" != "--no-restart" ]; then
+    docker compose -f "$COMPOSE" restart remnanode >/dev/null 2>&1 || true
+fi
+exit 0
+EOF
+}
+
+# Путь к сертификату Caddy для домена (пусто, если его нет)
+find_caddy_cert() {
+    hysteria_sync_script "$1" "" "" | sh -s -- --find 2>/dev/null || true
+}
+
+# Включить выдачу сертификата Caddy в Hysteria2: скрипт синхронизации, таймер и первая копия.
+# $1 — домен, $2 — каталог ноды
+hysteria_caddy_cert_setup() {
+    local domain="$1" node_path="$2" ssl_dir="$2/ssl" check enddate
+    hysteria_sync_script "$domain" "$ssl_dir" "$node_path/docker-compose.yml" > "$HYST_SYNC_BIN"
+    chmod 755 "$HYST_SYNC_BIN"
+
+    if ! "$HYST_SYNC_BIN" --no-restart; then
+        echo -e "${RED}[!] Не удалось скопировать сертификат Caddy для $domain.${NC}"
+        return 1
+    fi
+    check=$(openssl x509 -in "$ssl_dir/cert.pem" -noout -checkhost "$domain" 2>/dev/null || true)
+    if ! echo "$check" | grep -q 'does match'; then
+        echo -e "${RED}[!] Сертификат в $ssl_dir не подходит к домену $domain.${NC}"
+        return 1
+    fi
+    enddate=$(openssl x509 -in "$ssl_dir/cert.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+    echo -e "${GREEN}[*] ✅ Сертификат Caddy скопирован в $ssl_dir (действует до $enddate).${NC}"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > "/etc/systemd/system/$HYST_SYNC_UNIT.service" <<EOF
+[Unit]
+Description=Copy Caddy certificate for Hysteria2 (remnautility)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$HYST_SYNC_BIN
+EOF
+        cat > "/etc/systemd/system/$HYST_SYNC_UNIT.timer" <<'EOF'
+[Unit]
+Description=Daily check of Caddy certificate for Hysteria2 (remnautility)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if systemctl enable --now "$HYST_SYNC_UNIT.timer" >/dev/null 2>&1; then
+            echo -e "${GREEN}[*] ✅ Раз в сутки скрипт сверяет сертификат с Caddy и после продления перезапускает ноду.${NC}"
+        else
+            echo -e "${YELLOW}[!] Не удалось включить таймер. После продления Caddy запускайте: $HYST_SYNC_BIN${NC}"
+        fi
+    fi
+    return 0
+}
+
+# Сертификат снова от certbot — синхронизация с Caddy больше не нужна
+hysteria_caddy_sync_disable() {
+    if [ ! -f "$HYST_SYNC_BIN" ] && [ ! -f "/etc/systemd/system/$HYST_SYNC_UNIT.timer" ]; then
+        return 0
+    fi
+    systemctl disable --now "$HYST_SYNC_UNIT.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$HYST_SYNC_UNIT.service" "/etc/systemd/system/$HYST_SYNC_UNIT.timer" "$HYST_SYNC_BIN"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    return 0
+}
+
 setup_hysteria2() {
     echo -e "\n${CYAN}=== Настройка ноды под Hysteria2 ===${NC}"
-    
+
     while true; do
         read -p "Введите корневой путь папки ноды [/opt/remnanode]: " NODE_PATH
         NODE_PATH=${NODE_PATH:-/opt/remnanode}
@@ -469,32 +606,57 @@ setup_hysteria2() {
     done
 
     read -p "Укажите доменное имя (например, node.domain.com): " DOMAIN
+    DOMAIN=$(normalize_domain "$DOMAIN")
 
     safe_apt_install figlet
 
-    if ! ensure_certbot; then
-        read -p "Нажмите Enter, чтобы вернуться в меню..." || true
-        return
+    # Сертификат: у Caddy (selfsteal), если он уже есть для этого домена, иначе — certbot
+    local caddy_cert answer mounts=()
+    caddy_cert=$(find_caddy_cert "$DOMAIN")
+    if [ -n "$caddy_cert" ]; then
+        echo -e "${GREEN}[*] У Caddy уже есть сертификат для $DOMAIN:${NC}"
+        echo -e "    $caddy_cert"
+        echo -e "    Его можно отдать Hysteria2: certbot и 80/tcp не нужны, продлевает его Caddy,"
+        echo -e "    а скрипт раз в сутки сверяет копию и после продления перезапускает ноду."
+        read -p "Использовать сертификат Caddy? (Y/n): " answer || answer=""
+        if [[ "$answer" =~ ^[Nn]$ ]]; then caddy_cert=""; fi
     fi
 
-    CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
-
-    if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
-        echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
-    else
-        # Selfsteal-сайт (если есть) держит 80/tcp — на время выпуска останавливаем его
-        selfsteal_pause
-        acme_preflight "$DOMAIN"
-
-        echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN...${NC}"
-        if ! issue_certificate "$DOMAIN" "docker compose -f $NODE_PATH/docker-compose.yml restart remnanode"; then
-            selfsteal_resume
-            echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN. Конфигурация ноды не изменена.${NC}"
+    if [ -n "$caddy_cert" ]; then
+        if ! hysteria_caddy_cert_setup "$DOMAIN" "$NODE_PATH"; then
+            echo -e "${RED}[!] Конфигурация ноды не изменена.${NC}"
             read -p "Нажмите Enter, чтобы вернуться в меню..." || true
             return
         fi
-        selfsteal_resume
+        mounts=("$NODE_PATH/ssl:/var/lib/remnawave/configs/xray/ssl:ro")
+    else
+        if ! ensure_certbot; then
+            read -p "Нажмите Enter, чтобы вернуться в меню..." || true
+            return
+        fi
+
+        CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+        if [ -f "$CERT_PATH" ] && [ -f "$KEY_PATH" ]; then
+            echo -e "${GREEN}[*] ✅ Сертификаты для $DOMAIN уже существуют. Пропускаем выпуск.${NC}"
+        else
+            # Selfsteal-сайт (если есть) держит 80/tcp — на время выпуска останавливаем его
+            selfsteal_pause
+            acme_preflight "$DOMAIN"
+
+            echo -e "${GREEN}[*] Выпуск сертификатов для $DOMAIN...${NC}"
+            if ! issue_certificate "$DOMAIN" "docker compose -f $NODE_PATH/docker-compose.yml restart remnanode"; then
+                selfsteal_resume
+                echo -e "${RED}[!] Не удалось выпустить сертификаты для $DOMAIN. Конфигурация ноды не изменена.${NC}"
+                read -p "Нажмите Enter, чтобы вернуться в меню..." || true
+                return
+            fi
+            selfsteal_resume
+        fi
+        hysteria_caddy_sync_disable
+        mounts=("$CERT_PATH:/var/lib/remnawave/configs/xray/ssl/cert.pem:ro"
+                "$KEY_PATH:/var/lib/remnawave/configs/xray/ssl/cert.key:ro")
     fi
 
     COMPOSE_FILE="$NODE_PATH/docker-compose.yml"
@@ -506,22 +668,28 @@ setup_hysteria2() {
 
     sed -i '/\/var\/lib\/remnawave\/configs\/xray\/ssl/d' "$COMPOSE_FILE"
 
+    local m ins=""
     if grep -q "^[[:space:]]*volumes:" "$COMPOSE_FILE"; then
         VOL_INDENT=$(grep -m 1 "^[[:space:]]*volumes:" "$COMPOSE_FILE" | sed -E 's/^([[:space:]]*).*/\1/')
         ITEM_INDENT="${VOL_INDENT}  "
+        for m in "${mounts[@]}"; do
+            ins="${ins:+$ins\\
+}${ITEM_INDENT}- $m"
+        done
         sed -i "/^[[:space:]]*volumes:/a \\
-${ITEM_INDENT}- $CERT_PATH:/var/lib/remnawave/configs/xray/ssl/cert.pem:ro\\
-${ITEM_INDENT}- $KEY_PATH:/var/lib/remnawave/configs/xray/ssl/cert.key:ro" "$COMPOSE_FILE"
+$ins" "$COMPOSE_FILE"
     else
         BASE_INDENT=$(grep -m 1 "^[[:space:]]*\(environment\|restart\|image\):" "$COMPOSE_FILE" | sed -E 's/^([[:space:]]*).*/\1/')
         BASE_INDENT=${BASE_INDENT:-"    "}
         ITEM_INDENT="${BASE_INDENT}  "
-        cat <<EOF >> "$COMPOSE_FILE"
-${BASE_INDENT}volumes:
-${ITEM_INDENT}- $CERT_PATH:/var/lib/remnawave/configs/xray/ssl/cert.pem:ro
-${ITEM_INDENT}- $KEY_PATH:/var/lib/remnawave/configs/xray/ssl/cert.key:ro
-EOF
+        echo "${BASE_INDENT}volumes:" >> "$COMPOSE_FILE"
+        for m in "${mounts[@]}"; do
+            echo "${ITEM_INDENT}- $m" >> "$COMPOSE_FILE"
+        done
     fi
+
+    # Hysteria2 работает поверх QUIC — нужен UDP
+    firewall_allow_port 443 "клиенты Hysteria2 не подключатся" udp
 
     echo -e "${GREEN}[*] Скачивание обновленного образа (:latest)...${NC}"
     docker compose -f "$COMPOSE_FILE" pull
@@ -531,6 +699,7 @@ EOF
     docker compose -f "$COMPOSE_FILE" up -d
 
     echo -e "${GREEN}✅ Готово! Нода настроена для Hysteria2 (latest ветка).${NC}"
+    echo -e "    В панели у Host'а Hysteria2 этой ноды SNI должен быть $DOMAIN."
     read -p "Нажмите Enter, чтобы вернуться в меню..." || true
 }
 
@@ -3114,6 +3283,10 @@ selfsteal_remove() {
     selfsteal_load_env || true
 
     local answer c down_args=(down --remove-orphans)
+    if [ -f "$HYST_SYNC_BIN" ] && { [ "$SS_WEBSERVER" = "caddy" ] || [ "$SS_WEBSERVER" = "caddy-system" ]; }; then
+        echo -e "${YELLOW}[!] Hysteria2 на этой ноде берёт сертификат у Caddy. После удаления selfsteal${NC}"
+        echo -e "${YELLOW}    он перестанет продлеваться — перенастройте Hysteria2 (пункт 2 главного меню).${NC}"
+    fi
     read -p "Удалить selfsteal-сайт${SS_DOMAIN:+ $SS_DOMAIN}? (y/n): " answer || return 0
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
 
