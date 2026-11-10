@@ -489,6 +489,11 @@ if command -v docker >/dev/null 2>&1; then
         mp=$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null)
         [ -n "$mp" ] && roots="$roots $mp/caddy"
     done
+    # /data контейнеров (Caddy панели и т.п.): том может называться как угодно
+    for c in $(docker ps -q 2>/dev/null); do
+        mp=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$c" 2>/dev/null)
+        [ -n "$mp" ] && roots="$roots $mp/caddy"
+    done
 fi
 
 # Самый свежий боевой (не staging) сертификат домена
@@ -1530,6 +1535,8 @@ diagnose_local_drop() {
 # настоящим сертификатом Let's Encrypt. Xray слушает 443 и передаёт «чужие»
 # подключения на этот сайт (127.0.0.1:9443) — нода маскируется сама под себя.
 # Сайт занимает 80/tcp (сертификат) и 127.0.0.1:9443, порт 443 остаётся Xray.
+# Если на сервере уже есть Caddy (системный или в контейнере, например у панели)
+# или nginx — сайт встраивается в него, второй веб-сервер не ставится.
 # =============================================================================
 
 SELFSTEAL_DIR="/opt/selfsteal"
@@ -1594,7 +1601,7 @@ selfsteal_resume() {
 
 selfsteal_load_env() {
     SS_DOMAIN=""; SS_WEBSERVER=""; SS_PORT=""; SS_EXTRA_SNI=""; SS_CADDYFILE=""; SS_CADDY_UNIT=""
-    SS_NGINX_SITE=""; SS_NGINX_LINK=""; SS_NGINX_UNIT=""
+    SS_CADDY_CONTAINER=""; SS_CADDY_OVERRIDE=""; SS_NGINX_SITE=""; SS_NGINX_LINK=""; SS_NGINX_UNIT=""
     [ -f "$SELFSTEAL_ENV" ] || return 1
     SS_DOMAIN=$(sed -n 's/^DOMAIN=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_WEBSERVER=$(sed -n 's/^WEBSERVER=//p' "$SELFSTEAL_ENV" | tail -n 1)
@@ -1602,6 +1609,8 @@ selfsteal_load_env() {
     SS_EXTRA_SNI=$(sed -n 's/^EXTRA_SNI=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_CADDYFILE=$(sed -n 's/^CADDYFILE=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_CADDY_UNIT=$(sed -n 's/^CADDY_UNIT=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_CADDY_CONTAINER=$(sed -n 's/^CADDY_CONTAINER=//p' "$SELFSTEAL_ENV" | tail -n 1)
+    SS_CADDY_OVERRIDE=$(sed -n 's/^CADDY_OVERRIDE=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_NGINX_SITE=$(sed -n 's/^NGINX_SITE=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_NGINX_LINK=$(sed -n 's/^NGINX_LINK=//p' "$SELFSTEAL_ENV" | tail -n 1)
     SS_NGINX_UNIT=$(sed -n 's/^NGINX_UNIT=//p' "$SELFSTEAL_ENV" | tail -n 1)
@@ -1618,6 +1627,8 @@ PORT=$SS_PORT
 EXTRA_SNI=$SS_EXTRA_SNI
 CADDYFILE=$SS_CADDYFILE
 CADDY_UNIT=$SS_CADDY_UNIT
+CADDY_CONTAINER=$SS_CADDY_CONTAINER
+CADDY_OVERRIDE=$SS_CADDY_OVERRIDE
 NGINX_SITE=$SS_NGINX_SITE
 NGINX_LINK=$SS_NGINX_LINK
 NGINX_UNIT=$SS_NGINX_UNIT
@@ -1627,9 +1638,10 @@ EOF
 # Человекочитаемое название режима
 selfsteal_ws_label() {
     case "$1" in
-        caddy)        echo "Caddy в Docker" ;;
+        caddy)        echo "Caddy в Docker (selfsteal-caddy)" ;;
         nginx)        echo "Nginx в Docker" ;;
         caddy-system) echo "системный Caddy" ;;
+        caddy-docker) echo "Caddy из контейнера ${SS_CADDY_CONTAINER:-${DC_NAME:-Docker}}" ;;
         nginx-system) echo "системный nginx" ;;
         *)            echo "$1" ;;
     esac
@@ -2050,23 +2062,19 @@ detect_host_caddy() {
     return 0
 }
 
-# Блок selfsteal для Caddyfile: $1 — домен, $2 — локальный порт
+# Блок selfsteal для Caddyfile: $1 — домен, $2 — локальный порт, $3 — каталог страницы
+# (как его видит Caddy), $4 — адрес bind (пусто — без bind: Caddy в контейнере с
+# пробросом 127.0.0.1:$2 с хоста).
 selfsteal_caddy_block() {
-    cat <<EOF
-$SELFSTEAL_MARK_BEGIN
-# Selfsteal для VLESS Reality (remnautility): Xray на 443 отдаёт «чужие» подключения
-# этому сайту. Сертификат — через 80/tcp, сам сайт слушает только 127.0.0.1:$2.
-http://$1 {
-	redir https://{host}{uri} permanent
-}
-
-https://$1:$2 {
-	bind 127.0.0.1
-	root * $SELFSTEAL_DIR/html
-	file_server
-}
-$SELFSTEAL_MARK_END
-EOF
+    local root="${3:-$SELFSTEAL_DIR/html}" bind="${4-127.0.0.1}"
+    echo "$SELFSTEAL_MARK_BEGIN"
+    echo "# Selfsteal для VLESS Reality (remnautility): Xray на 443 отдаёт «чужие» подключения"
+    echo "# этому сайту. Сертификат — через 80/tcp, сам сайт доступен только на 127.0.0.1:$2."
+    printf 'http://%s {\n\tredir https://{host}{uri} permanent\n}\n\n' "$1"
+    printf 'https://%s:%s {\n' "$1" "$2"
+    if [ -n "$bind" ]; then printf '\tbind %s\n' "$bind"; fi
+    printf '\troot * %s\n\tfile_server\n}\n' "$root"
+    echo "$SELFSTEAL_MARK_END"
 }
 
 # Caddyfile $1 -> $2 без блока скрипта, без сайтов, чей адрес — только домен $3
@@ -2116,6 +2124,44 @@ caddyfile_strip_selfsteal() {
     return "$rc"
 }
 
+# Новый Caddyfile $4 из $1: без прежнего блока скрипта и ручных блоков домена $2, плюс блок
+# selfsteal ($3 — его текст). Ручные блоки домена показывает и заменяет только с согласия.
+caddyfile_with_selfsteal() {
+    local cfg="$1" domain="$2" block="$3" new="$4" plain rc=0 removed answer
+    caddyfile_strip_selfsteal "$cfg" "$new" "$domain" || rc=$?
+    if [ "$rc" = "3" ]; then
+        echo -e "${RED}[!] В $cfg домен $domain указан в одном блоке с другими адресами.${NC}"
+        echo -e "${RED}    Уберите его оттуда вручную и запустите установку снова.${NC}"
+        return 1
+    fi
+    # Сравнение с вариантом, где убран только блок скрипта: отличие = ручные блоки домена
+    plain=$(mktemp)
+    caddyfile_strip_selfsteal "$cfg" "$plain" "" || true
+    if ! cmp -s "$plain" "$new"; then
+        removed=$(diff "$plain" "$new" 2>/dev/null | sed -n 's/^< \{0,1\}//p' | sed '/[^[:space:]]/,$!d' || true)
+        echo -e "${YELLOW}[*] В $cfg уже есть блоки для $domain (настроены вручную) — их заменит блок скрипта:${NC}"
+        echo "$removed" | head -n 30 | sed 's/^/    /'
+        if echo "$removed" | grep -qE '^[[:space:]]*(reverse_proxy|php_fastcgi)'; then
+            # Скорее всего, ввели домен панели или другого сервиса — по умолчанию не трогаем
+            echo -e "${RED}[!] Там reverse_proxy — похоже, это сайт панели или другого сервиса, а не заглушка.${NC}"
+            echo -e "${RED}    Для selfsteal нужен свой поддомен этой ноды, а не домен панели.${NC}"
+            read -p "Всё равно заменить эти блоки блоком selfsteal? (y/N): " answer || answer=""
+            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                rm -f "$plain"
+                return 1
+            fi
+        else
+            read -p "Заменить эти блоки блоком selfsteal? (Y/n): " answer || answer=""
+            if [[ "$answer" =~ ^[Nn]$ ]]; then
+                rm -f "$plain"
+                return 1
+            fi
+        fi
+    fi
+    rm -f "$plain"
+    { echo; printf '%s\n' "$block"; } >> "$new"
+}
+
 # Проверка Caddyfile тем же caddy, что и работает. Ошибки — в HC_VALIDATE_ERR.
 host_caddy_validate() {
     HC_VALIDATE_ERR=$("$HC_BIN" validate --config "$1" --adapter caddyfile 2>&1 >/dev/null) && return 0
@@ -2142,26 +2188,16 @@ host_caddy_reload() {
 # Встроить selfsteal в найденный Caddy: правка Caddyfile -> проверка -> reload/запуск.
 # При любой ошибке Caddyfile возвращается как был. $1 — домен, $2 — локальный порт.
 host_caddy_apply() {
-    local domain="$1" port="$2" cfg="$HC_CONFIG" new plain rc=0 orig_ok=1
+    local domain="$1" port="$2" cfg="$HC_CONFIG" new orig_ok=1
     local bak="$HC_CONFIG.remnautility.bak"
 
     # Временный файл рядом с конфигом: относительные import'ы разрешаются так же
     new=$(mktemp "$(dirname "$cfg")/.Caddyfile.remnautility.XXXXXX") || return 1
-    caddyfile_strip_selfsteal "$cfg" "$new" "$domain" || rc=$?
-    if [ "$rc" = "3" ]; then
-        echo -e "${RED}[!] В $cfg домен $domain указан в одном блоке с другими адресами.${NC}"
-        echo -e "${RED}    Уберите его оттуда вручную и запустите установку снова.${NC}"
+    if ! caddyfile_with_selfsteal "$cfg" "$domain" \
+        "$(selfsteal_caddy_block "$domain" "$port" "$SELFSTEAL_DIR/html" 127.0.0.1)" "$new"; then
         rm -f "$new"
         return 1
     fi
-    # Сравнение с вариантом, где убран только блок скрипта: отличие = ручные блоки домена
-    plain=$(mktemp)
-    caddyfile_strip_selfsteal "$cfg" "$plain" "" || true
-    if ! cmp -s "$plain" "$new"; then
-        echo -e "${YELLOW}[*] В $cfg уже были блоки для $domain (настроены вручную) — заменяю их блоком скрипта.${NC}"
-    fi
-    rm -f "$plain"
-    { echo; selfsteal_caddy_block "$domain" "$port"; } >> "$new"
 
     echo -e "${CYAN}[*] Проверяю новый Caddyfile...${NC}"
     if ! host_caddy_validate "$cfg"; then
@@ -2236,6 +2272,515 @@ host_caddy_remove_block() {
     return 0
 }
 
+# --- Caddy в Docker-контейнере (например, Caddy панели Remnawave) ---------------
+# Если панель стоит на этом же сервере за Caddy в контейнере, 80/tcp занят им, и второй
+# Caddy рядом не встанет. Тогда selfsteal добавляется в Caddyfile этого контейнера (тот же
+# блок между метками), а страница и порт сайта подключаются к контейнеру override-файлом
+# его compose-проекта: docker-compose.yml пользователя скрипт не правит.
+
+SELFSTEAL_DC_ROOT="/srv/selfsteal"
+SELFSTEAL_OVERRIDE_MARK="# remnautility selfsteal"
+SELFSTEAL_OVERRIDE_ALT="remnautility-selfsteal.compose.yml"
+
+# Сведения о контейнере Caddy $1. Заполняет DC_NAME, DC_ID, DC_IMAGE, DC_RUNNING (0/1), DC_NET,
+# DC_IPS, DC_PORTS (строки «порт_контейнера/tcp|IP_хоста|порт_хоста»), DC_CONFIG_IN (Caddyfile в
+# контейнере), DC_CONFIG (он же на хосте), DC_HTML_IN (куда уже смонтирована страница selfsteal),
+# DC_COMPOSE (0/1), DC_PROJECT, DC_SERVICE, DC_WORKDIR, DC_BASE_FILES (файлы проекта без нашего
+# override), DC_OVERRIDE (наш override), DC_AUTOLOAD (подхватит ли его docker compose без -f)
+# и DC_PROBLEM — причину, по которой встроиться нельзя. Код 1 — такого контейнера нет.
+dc_inspect() {
+    local name="$1" info line key val wd="" files="" cfg="" adapter="" resume=0 base hp
+    local i a src dst best_len=-1 f n foreign=0
+    local argv=() mounts=() list=()
+    DC_NAME=""; DC_ID=""; DC_IMAGE=""; DC_RUNNING=0; DC_NET=""; DC_IPS=""; DC_PORTS=""
+    DC_CONFIG_IN=""; DC_CONFIG=""; DC_HTML_IN=""; DC_COMPOSE=0; DC_PROJECT=""; DC_SERVICE=""
+    DC_WORKDIR=""; DC_BASE_FILES=(); DC_OVERRIDE=""; DC_AUTOLOAD=0; DC_PROBLEM=""
+    [ -n "$name" ] || return 1
+    command -v docker >/dev/null 2>&1 || return 1
+    info=$(docker container inspect -f 'id={{.Id}}
+name={{.Name}}
+image={{.Image}}
+running={{.State.Running}}
+net={{.HostConfig.NetworkMode}}
+workdir={{.Config.WorkingDir}}
+project={{index .Config.Labels "com.docker.compose.project"}}
+service={{index .Config.Labels "com.docker.compose.service"}}
+pwd={{index .Config.Labels "com.docker.compose.project.working_dir"}}
+files={{index .Config.Labels "com.docker.compose.project.config_files"}}
+{{range .Mounts}}mount={{.Source}}|{{.Destination}}
+{{end}}{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}port={{$p}}|{{.HostIp}}|{{.HostPort}}
+{{end}}{{end}}{{range .NetworkSettings.Networks}}ip={{.IPAddress}}
+{{end}}path={{.Path}}
+{{range .Args}}arg={{.}}
+{{end}}' "$name" 2>/dev/null) || return 1
+
+    while IFS= read -r line; do
+        key=${line%%=*}; val=${line#*=}
+        if [ "$val" = "<no value>" ]; then val=""; fi
+        case "$key" in
+            id)      DC_ID=$val ;;
+            name)    DC_NAME=${val#/} ;;
+            image)   DC_IMAGE=$val ;;
+            running) if [ "$val" = "true" ]; then DC_RUNNING=1; fi ;;
+            net)     DC_NET=$val ;;
+            workdir) wd=$val ;;
+            project) DC_PROJECT=$val ;;
+            service) DC_SERVICE=$val ;;
+            pwd)     DC_WORKDIR=$val ;;
+            files)   files=$val ;;
+            mount)   mounts+=("$val") ;;
+            port)    DC_PORTS="${DC_PORTS:+$DC_PORTS$'\n'}$val" ;;
+            ip)      if [ -n "$val" ]; then DC_IPS="${DC_IPS:+$DC_IPS }$val"; fi ;;
+            path)    argv=("$val") ;;
+            arg)     argv+=("$val") ;;
+        esac
+    done <<< "$info"
+    [ -n "$DC_NAME" ] || return 1
+
+    for ((i = 1; i < ${#argv[@]}; i++)); do
+        a=${argv[$i]}
+        case "$a" in
+            --config|-c)  cfg=${argv[$((i + 1))]:-}; i=$((i + 1)) ;;
+            --config=*)   cfg=${a#--config=} ;;
+            --adapter|-a) adapter=${argv[$((i + 1))]:-}; i=$((i + 1)) ;;
+            --adapter=*)  adapter=${a#--adapter=} ;;
+            --resume)     resume=1 ;;
+        esac
+    done
+    if [ -z "$cfg" ] && [ "$resume" = "1" ]; then
+        DC_PROBLEM="Caddy настроен через API (--resume), а не через Caddyfile"
+        return 0
+    fi
+    # Без --config Caddy читает ./Caddyfile из рабочего каталога контейнера
+    cfg=${cfg:-Caddyfile}
+    if [[ "$cfg" != /* ]]; then cfg="${wd%/}/$cfg"; fi
+    DC_CONFIG_IN=$cfg
+
+    # Caddyfile на хосте — по самому точному монтированию; заодно ищем страницу selfsteal
+    for line in "${mounts[@]}"; do
+        src=${line%%|*}; dst=${line#*|}
+        if [ "$cfg" = "$dst" ] || [[ "$cfg" == "${dst%/}/"* ]]; then
+            if [ "${#dst}" -gt "$best_len" ]; then
+                best_len=${#dst}
+                DC_CONFIG="${src%/}${cfg#"${dst%/}"}"
+            fi
+        fi
+        if [ "${src%/}" = "$SELFSTEAL_DIR/html" ]; then
+            DC_HTML_IN=$dst
+        elif [ "${src%/}" = "$SELFSTEAL_DIR" ] && [ -z "$DC_HTML_IN" ]; then
+            DC_HTML_IN="${dst%/}/html"
+        fi
+    done
+
+    base=${cfg##*/}
+    if [ -z "$DC_CONFIG" ]; then
+        DC_PROBLEM="его конфиг $cfg лежит внутри контейнера, а не смонтирован с хоста"
+    elif [ -n "$adapter" ] && [ "$adapter" != "caddyfile" ]; then
+        DC_PROBLEM="конфиг в формате $adapter, а не Caddyfile"
+    elif [ -z "$adapter" ] && [[ "$base" != Caddyfile* ]] && [[ "$base" != *.caddyfile ]]; then
+        DC_PROBLEM="конфиг $cfg в формате JSON, а не Caddyfile"
+    elif [ ! -f "$DC_CONFIG" ]; then
+        DC_PROBLEM="не найден файл конфигурации $DC_CONFIG"
+    elif grep -qE '^[[:space:]]*auto_https[[:space:]]+off' "$DC_CONFIG"; then
+        DC_PROBLEM="в $DC_CONFIG выключен auto_https — сертификат получен не будет"
+    fi
+    [ -z "$DC_PROBLEM" ] || return 0
+
+    # Let's Encrypt проверяет домен по 80/tcp хоста: он должен вести на http_port Caddy
+    hp=$(sed -n 's/^[[:space:]]*http_port[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p' "$DC_CONFIG" | head -n 1)
+    hp=${hp:-80}
+    case "$DC_NET" in
+        host)
+            if [ "$hp" != "80" ]; then
+                DC_PROBLEM="в $DC_CONFIG задан http_port $hp — Let's Encrypt проверяет домен именно по 80/tcp"
+            fi
+            ;;
+        none|container:*)
+            DC_PROBLEM="у контейнера нет своей сети (network_mode: $DC_NET) — порт сайта не пробросить"
+            ;;
+        *)
+            if ! echo "$DC_PORTS" | grep -qE "^$hp/tcp\|[^|]*\|80$"; then
+                DC_PROBLEM="контейнер не публикует 80/tcp — Let's Encrypt не сможет проверить домен"
+            fi
+            ;;
+    esac
+    [ -z "$DC_PROBLEM" ] || return 0
+
+    # Compose-проект: порт и страницу добавим своим override-файлом
+    if [ -n "$DC_PROJECT" ] && [ -n "$DC_SERVICE" ] && [ -n "$DC_WORKDIR" ] && [ -n "$files" ]; then
+        DC_COMPOSE=1
+        IFS=',' read -r -a list <<< "$files"
+        for f in "${list[@]}"; do
+            [ -n "$f" ] || continue
+            if [ -f "$f" ] && head -n 1 "$f" 2>/dev/null | grep -qF "$SELFSTEAL_OVERRIDE_MARK"; then
+                DC_OVERRIDE=$f
+            else
+                DC_BASE_FILES+=("$f")
+            fi
+        done
+        # Наш override — по метке в первой строке. Чужой займёт место, которое compose
+        # подхватывает сам (берёт только первый найденный), — тогда свой кладём рядом.
+        for n in compose.override.yml compose.override.yaml docker-compose.override.yml \
+            docker-compose.override.yaml "$SELFSTEAL_OVERRIDE_ALT"; do
+            f="$DC_WORKDIR/$n"
+            [ -f "$f" ] || continue
+            if head -n 1 "$f" 2>/dev/null | grep -qF "$SELFSTEAL_OVERRIDE_MARK"; then
+                if [ -z "$DC_OVERRIDE" ]; then DC_OVERRIDE=$f; fi
+            elif [ "$n" != "$SELFSTEAL_OVERRIDE_ALT" ]; then
+                foreign=1
+            fi
+        done
+        if [ "$foreign" = "1" ] && [ "${DC_OVERRIDE##*/}" != "$SELFSTEAL_OVERRIDE_ALT" ]; then
+            DC_OVERRIDE="$DC_WORKDIR/$SELFSTEAL_OVERRIDE_ALT"
+        elif [ -z "$DC_OVERRIDE" ]; then
+            if [[ "${DC_BASE_FILES[0]:-}" == */compose.* ]]; then
+                DC_OVERRIDE="$DC_WORKDIR/compose.override.yml"
+            else
+                DC_OVERRIDE="$DC_WORKDIR/docker-compose.override.yml"
+            fi
+        fi
+        # Без -f compose подхватит override, только если и основной файл находит сам
+        if [ "${#DC_BASE_FILES[@]}" = "1" ] && [ "$foreign" = "0" ] \
+            && [ "${DC_OVERRIDE##*/}" != "$SELFSTEAL_OVERRIDE_ALT" ]; then
+            case "${DC_BASE_FILES[0]}" in
+                "$DC_WORKDIR"/compose.yaml|"$DC_WORKDIR"/compose.yml|"$DC_WORKDIR"/docker-compose.yml|"$DC_WORKDIR"/docker-compose.yaml)
+                    DC_AUTOLOAD=1 ;;
+            esac
+        fi
+        if [ "${#DC_BASE_FILES[@]}" = "0" ] || [ ! -f "${DC_BASE_FILES[0]}" ]; then
+            DC_PROBLEM="не найден его compose-файл ($files)"
+        fi
+    fi
+    return 0
+}
+
+# Ищет Caddy в Docker-контейнере (кроме контейнеров скрипта). Работающий и с 80/tcp — в
+# приоритете. Заполняет DC_* (см. dc_inspect). Возвращает 1, если такого контейнера нет.
+detect_docker_caddy() {
+    local id line name image path running net wd hports best="" best_score=-1 score
+    DC_NAME=""; DC_RUNNING=0; DC_PROBLEM=""
+    command -v docker >/dev/null 2>&1 || return 1
+    for id in $(docker ps -aq 2>/dev/null || true); do
+        line=$(docker container inspect -f '{{.Name}}|{{.Config.Image}}|{{.Path}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}|{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}},{{end}}{{end}}' "$id" 2>/dev/null) || continue
+        IFS='|' read -r name image path running net wd hports <<< "$line"
+        name=${name#/}
+        case " $SELFSTEAL_CONTAINERS " in *" $name "*) continue ;; esac
+        if [ "$wd" = "$SELFSTEAL_DIR" ]; then continue; fi
+        if [ "${path##*/}" != "caddy" ] && [[ "${image,,}" != *caddy* ]]; then continue; fi
+        score=0
+        if [ "$running" = "true" ]; then score=2; fi
+        if [ "$net" = "host" ] || [[ ",$hports" == *",80,"* ]]; then score=$((score + 1)); fi
+        if [ "$score" -gt "$best_score" ]; then best=$name; best_score=$score; fi
+    done
+    [ -n "$best" ] || return 1
+    dc_inspect "$best"
+}
+
+# Порты, которые контейнер публикует на хосте
+dc_host_ports() {
+    echo "$DC_PORTS" | awk -F'|' 'NF == 3 && $3 != "" { print $3 }' | sort -un
+}
+
+# Контейнер уже публикует порт $1 как 127.0.0.1:$1 -> $1?
+dc_publishes_local() {
+    echo "$DC_PORTS" | grep -qxF "$1/tcp|127.0.0.1|$1"
+}
+
+# PID процессов контейнера и docker-proxy его портов — кто держит его порты на хосте
+dc_pids() {
+    local ip pids=""
+    [ "$DC_RUNNING" = "1" ] || return 0
+    pids=$(docker top "$DC_NAME" -eo pid 2>/dev/null | tail -n +2 | tr -s ' \n' ' ' || true)
+    for ip in $DC_IPS; do
+        pids="$pids $(pgrep -f -- "-container-ip ${ip//./\\.} " 2>/dev/null | tr '\n' ' ' || true)"
+    done
+    echo $pids
+}
+
+# docker compose для проекта контейнера: $1=1 — вместе с нашим override, дальше — команда
+dc_compose() {
+    local with_override="$1" f
+    shift
+    local args=(-p "$DC_PROJECT" --project-directory "$DC_WORKDIR")
+    for f in "${DC_BASE_FILES[@]}"; do args+=(-f "$f"); done
+    if [ "$with_override" = "1" ]; then args+=(-f "$DC_OVERRIDE"); fi
+    if docker compose version >/dev/null 2>&1; then
+        docker compose "${args[@]}" "$@"
+    else
+        docker-compose "${args[@]}" "$@"
+    fi
+}
+
+# Пересоздать/запустить контейнер Caddy по compose: $1=1 — с нашим override,
+# $2=0 — только пересоздать, не запуская. Вывод compose показываем только при ошибке.
+dc_compose_up() {
+    local out act=(up -d)
+    if [ "${2:-1}" != "1" ]; then act=(up --no-start); fi
+    out=$(dc_compose "$1" "${act[@]}" --no-deps "$DC_SERVICE" 2>&1) && return 0
+    echo "$out" | grep -v '^[[:space:]]*$' | tail -n 8 | sed 's/^/    /'
+    return 1
+}
+
+# Текст нашего override: страница selfsteal и (если сеть не host) порт сайта на 127.0.0.1
+dc_override_text() {
+    if [ "$DC_NET" = "host" ]; then
+        echo "$SELFSTEAL_OVERRIDE_MARK: файл создан скриптом — страница selfsteal-сайта для Caddy."
+    else
+        echo "$SELFSTEAL_OVERRIDE_MARK: файл создан скриптом — страница и порт selfsteal-сайта для Caddy."
+    fi
+    if [ "$DC_AUTOLOAD" = "1" ]; then
+        echo "# docker compose в этом каталоге подключает его к ${DC_BASE_FILES[0]##*/} сам."
+    else
+        echo "# Сам docker compose его не подхватит, подключайте явно:"
+        echo "# docker compose$(printf ' -f %s' "${DC_BASE_FILES[@]}") -f $DC_OVERRIDE up -d $DC_SERVICE"
+    fi
+    echo "# Удаляется вместе с selfsteal (меню Selfsteal → Удалить)."
+    echo "services:"
+    echo "  $DC_SERVICE:"
+    if [ "$DC_NET" != "host" ]; then
+        echo "    ports:"
+        echo "      - \"127.0.0.1:$1:$1\""
+    fi
+    echo "    volumes:"
+    echo "      - $SELFSTEAL_DIR/html:$SELFSTEAL_DC_ROOT:ro"
+}
+
+# Контейнер Caddy поднялся и не перезапускается по кругу?
+dc_wait_running() {
+    local i st first=""
+    for i in 1 2; do
+        sleep 3
+        st=$(docker container inspect -f '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}' "$DC_NAME" 2>/dev/null || true)
+        case "$st" in
+            "true false "*) ;;
+            *) return 1 ;;
+        esac
+        if [ -z "$first" ]; then first=$st; fi
+        if [ "$st" != "$first" ]; then return 1; fi
+    done
+    return 0
+}
+
+# Проверка Caddyfile $1 тем же Caddy, что в контейнере (конфиг — через stdin; остановленный
+# контейнер — разовым запуском его образа с его переменными окружения). Ошибки — в HC_VALIDATE_ERR.
+docker_caddy_validate() {
+    if [ "$DC_RUNNING" = "1" ]; then
+        HC_VALIDATE_ERR=$(docker exec -i "$DC_NAME" caddy validate --config /dev/stdin --adapter caddyfile \
+            < "$1" 2>&1 >/dev/null) && return 0
+    else
+        HC_VALIDATE_ERR=$(docker run --rm -i --network none --entrypoint caddy \
+            --env-file <(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$DC_NAME" 2>/dev/null | grep . || true) \
+            "$DC_IMAGE" validate --config /dev/stdin --adapter caddyfile < "$1" 2>&1 >/dev/null) && return 0
+    fi
+    HC_VALIDATE_ERR=$(echo "$HC_VALIDATE_ERR" | grep -vE '"level":"(info|warn)"' | tail -n 6)
+    return 1
+}
+
+# Перечитать конфиг Caddy в контейнере без остановки, в крайнем случае — перезапустить контейнер
+docker_caddy_reload() {
+    local answer
+    # Смонтированный одиночный файл «отвязывается», если его заменили новым (так сохраняют
+    # некоторые редакторы): контейнер видит старую копию, и поможет только перезапуск
+    if docker exec "$DC_NAME" cat "$DC_CONFIG_IN" 2>/dev/null | cmp -s - "$DC_CONFIG"; then
+        if docker exec "$DC_NAME" caddy reload --config "$DC_CONFIG_IN" --adapter caddyfile --force >/dev/null 2>&1; then
+            return 0
+        fi
+        echo -e "${YELLOW}[!] Перечитать конфиг без остановки не вышло (например, в Caddyfile «admin off»).${NC}"
+    else
+        echo -e "${YELLOW}[!] Контейнер $DC_NAME видит старую копию $DC_CONFIG (файл заменяли целиком) —${NC}"
+        echo -e "${YELLOW}    новый конфиг он прочитает только после перезапуска.${NC}"
+    fi
+    read -p "Перезапустить контейнер $DC_NAME? Сайты на нём прервутся на пару секунд (y/n): " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]] || return 1
+    docker restart "$DC_NAME" >/dev/null 2>&1 && dc_wait_running
+}
+
+# Откат docker_caddy_apply: $1 — копия Caddyfile, $2 — копия прежнего override (пусто — его
+# не было), $3=1 — override меняли, $4=1 — контейнер работал до изменений
+docker_caddy_restore() {
+    local bak="$1" ov_bak="$2" ov_changed="$3" was_running="$4" with=0
+    cat "$bak" > "$DC_CONFIG"
+    if [ "$DC_COMPOSE" = "1" ] && [ "$ov_changed" = "1" ]; then
+        if [ -n "$ov_bak" ]; then
+            cat "$ov_bak" > "$DC_OVERRIDE"
+            rm -f "$ov_bak"
+        else
+            rm -f "$DC_OVERRIDE"
+        fi
+        if [ -f "$DC_OVERRIDE" ]; then with=1; fi
+        dc_compose_up "$with" "$was_running" >/dev/null 2>&1 || true
+    fi
+    if [ "$was_running" = "1" ]; then
+        if [ "$(docker container inspect -f '{{.State.Running}}' "$DC_NAME" 2>/dev/null || true)" = "true" ]; then
+            docker exec "$DC_NAME" caddy reload --config "$DC_CONFIG_IN" --adapter caddyfile --force >/dev/null 2>&1 \
+                || docker restart "$DC_NAME" >/dev/null 2>&1 || true
+        else
+            docker start "$DC_NAME" >/dev/null 2>&1 || true
+        fi
+    else
+        docker stop "$DC_NAME" >/dev/null 2>&1 || true
+    fi
+}
+
+# Встроить selfsteal в Caddy из контейнера: блок в Caddyfile; страница и порт сайта — override
+# compose-проекта; затем пересоздание контейнера или reload. При ошибке всё возвращается как было.
+# $1 — домен, $2 — локальный порт.
+docker_caddy_apply() {
+    local domain="$1" port="$2" cfg="$DC_CONFIG" new root bind="" orig_ok=1 was_running="$DC_RUNNING"
+    local bak="$DC_CONFIG.remnautility.bak" ov_text="" ov_bak="" ov_changed=0 new_id
+    # В сети host Caddy слушает прямо на хосте — как системный, только на 127.0.0.1.
+    # В своей сети — слушает в контейнере, а на хост порт пробрасывается как 127.0.0.1:$port.
+    if [ "$DC_NET" = "host" ]; then bind="127.0.0.1"; fi
+
+    if [ "$DC_COMPOSE" = "1" ]; then
+        root=$SELFSTEAL_DC_ROOT
+    else
+        root=$DC_HTML_IN
+        if [ -z "$root" ] || { [ "$DC_NET" != "host" ] && ! dc_publishes_local "$port"; }; then
+            echo -e "${RED}[!] Контейнер $DC_NAME запущен не через docker compose — добавить ему порт и каталог скрипт не может.${NC}"
+            echo -e "${YELLOW}    Пересоздайте контейнер, добавив к параметрам docker run:${NC}"
+            if [ "$DC_NET" != "host" ] && ! dc_publishes_local "$port"; then
+                echo -e "${YELLOW}      -p 127.0.0.1:$port:$port${NC}"
+            fi
+            if [ -z "$root" ]; then
+                echo -e "${YELLOW}      -v $SELFSTEAL_DIR/html:$SELFSTEAL_DC_ROOT:ro${NC}"
+            fi
+            echo -e "${YELLOW}    и запустите установку selfsteal снова.${NC}"
+            return 1
+        fi
+    fi
+
+    new=$(mktemp) || return 1
+    if ! caddyfile_with_selfsteal "$cfg" "$domain" \
+        "$(selfsteal_caddy_block "$domain" "$port" "$root" "$bind")" "$new"; then
+        rm -f "$new"
+        return 1
+    fi
+
+    echo -e "${CYAN}[*] Проверяю новый Caddyfile тем же Caddy, что в контейнере $DC_NAME...${NC}"
+    if ! docker_caddy_validate "$cfg"; then
+        orig_ok=0
+    fi
+    if ! docker_caddy_validate "$new"; then
+        if [ "$orig_ok" = "1" ]; then
+            echo -e "${RED}[!] Caddy не принимает конфиг с блоком selfsteal:${NC}"
+            echo "$HC_VALIDATE_ERR" | sed 's/^/    /'
+            rm -f "$new"
+            return 1
+        fi
+        echo -e "${YELLOW}[!] Заранее проверить конфиг не удалось (текущий тоже не проходит проверку —${NC}"
+        echo -e "${YELLOW}    возможно, в нём import'ы по относительным путям). Применю с откатом при ошибке.${NC}"
+    fi
+
+    if [ "$DC_COMPOSE" = "1" ]; then
+        ov_text=$(dc_override_text "$port")
+        if [ -f "$DC_OVERRIDE" ]; then
+            if [ "$ov_text" != "$(cat "$DC_OVERRIDE")" ]; then
+                ov_changed=1
+                ov_bak=$(mktemp)
+                cp -p "$DC_OVERRIDE" "$ov_bak"
+            fi
+        else
+            ov_changed=1
+        fi
+    fi
+
+    # Пишем поверх, а не заменяем файл: так смонтированный в контейнер Caddyfile не «отвяжется»
+    cp -p "$cfg" "$bak"
+    cat "$new" > "$cfg"
+    rm -f "$new"
+    echo -e "${GREEN}[*] Блок selfsteal добавлен в $cfg (копия прежнего — $bak).${NC}"
+
+    if [ "$DC_COMPOSE" = "1" ]; then
+        if [ "$ov_changed" = "1" ]; then
+            printf '%s\n' "$ov_text" > "$DC_OVERRIDE"
+            if [ "$DC_NET" = "host" ]; then
+                echo -e "${GREEN}[*] Страница selfsteal подключена к контейнеру в $DC_OVERRIDE.${NC}"
+            else
+                echo -e "${GREEN}[*] Страница selfsteal и порт 127.0.0.1:$port подключены к контейнеру в $DC_OVERRIDE.${NC}"
+            fi
+            echo -e "${GREEN}[*] Пересоздаю контейнер $DC_NAME (docker compose up -d $DC_SERVICE)...${NC}"
+        elif [ "$was_running" != "1" ]; then
+            echo -e "${GREEN}[*] Запускаю контейнер $DC_NAME (docker compose up -d $DC_SERVICE)...${NC}"
+        fi
+        if ! dc_compose_up 1; then
+            echo -e "${RED}[!] docker compose не смог запустить контейнер (см. выше) — возвращаю всё как было.${NC}"
+            docker_caddy_restore "$bak" "$ov_bak" "$ov_changed" "$was_running"
+            return 1
+        fi
+    elif [ "$was_running" != "1" ]; then
+        echo -e "${GREEN}[*] Контейнер $DC_NAME остановлен — запускаю...${NC}"
+        if ! docker start "$DC_NAME" >/dev/null 2>&1; then
+            echo -e "${RED}[!] Контейнер не запустился — возвращаю Caddyfile как был.${NC}"
+            docker_caddy_restore "$bak" "" 0 0
+            return 1
+        fi
+    fi
+
+    new_id=$(docker container inspect -f '{{.Id}}' "$DC_NAME" 2>/dev/null || true)
+    if [ "$was_running" = "1" ] && [ "$new_id" = "$DC_ID" ]; then
+        # Контейнер не пересоздавался — Caddy перечитывает конфиг на ходу
+        echo -e "${GREEN}[*] Перечитываю конфиг Caddy без остановки...${NC}"
+        if ! docker_caddy_reload; then
+            echo -e "${RED}[!] Caddy не принял новый конфиг — возвращаю всё как было.${NC}"
+            selfsteal_show_errors "$DC_NAME"
+            docker_caddy_restore "$bak" "$ov_bak" "$ov_changed" "$was_running"
+            return 1
+        fi
+    elif ! dc_wait_running; then
+        echo -e "${RED}[!] Контейнер $DC_NAME не работает после изменений — возвращаю всё как было.${NC}"
+        selfsteal_show_errors "$DC_NAME"
+        docker_caddy_restore "$bak" "$ov_bak" "$ov_changed" "$was_running"
+        return 1
+    fi
+    if [ -n "$ov_bak" ]; then rm -f "$ov_bak"; fi
+    # Свежие сведения о контейнере (новый ID, порты) — для сообщений и статуса
+    dc_inspect "$DC_NAME" || true
+    return 0
+}
+
+# Убрать selfsteal из Caddy в контейнере $1: блок из Caddyfile и наш override (контейнер
+# пересоздаётся без страницы и порта selfsteal). Сам Caddy и остальные сайты не трогаем.
+docker_caddy_remove_block() {
+    local name="${1:-$SS_CADDY_CONTAINER}" cfg ov new have=0 changed=0 recreate=0
+    if dc_inspect "$name"; then have=1; fi
+    cfg=${DC_CONFIG:-$SS_CADDYFILE}
+    ov=$SS_CADDY_OVERRIDE
+    if [ -n "$DC_OVERRIDE" ] && [ -f "$DC_OVERRIDE" ]; then ov=$DC_OVERRIDE; fi
+
+    if [ -n "$cfg" ] && [ -f "$cfg" ] && grep -qF "$SELFSTEAL_MARK_BEGIN" "$cfg"; then
+        new=$(mktemp)
+        caddyfile_strip_selfsteal "$cfg" "$new" "" || true
+        cp -p "$cfg" "$cfg.remnautility.bak"
+        cat "$new" > "$cfg"
+        rm -f "$new"
+        changed=1
+        echo -e "${GREEN}[*] Блок selfsteal убран из $cfg.${NC}"
+    fi
+    if [ -n "$ov" ] && [ -f "$ov" ] && head -n 1 "$ov" 2>/dev/null | grep -qF "$SELFSTEAL_OVERRIDE_MARK"; then
+        rm -f "$ov"
+        recreate=1
+        echo -e "${GREEN}[*] Удалён $ov.${NC}"
+    fi
+    [ "$have" = "1" ] || return 0
+
+    if [ "$recreate" = "1" ] && [ "$DC_COMPOSE" = "1" ]; then
+        echo -e "${GREEN}[*] Пересоздаю контейнер $DC_NAME без страницы и порта selfsteal...${NC}"
+        if dc_compose_up 0 "$DC_RUNNING"; then
+            echo -e "${GREEN}[*] Контейнер $DC_NAME пересоздан, остальные его сайты работают как прежде.${NC}"
+        else
+            echo -e "${YELLOW}[!] Не вышло — пересоздайте вручную: cd $DC_WORKDIR && docker compose up -d $DC_SERVICE${NC}"
+        fi
+    elif [ "$changed" = "1" ] && [ "$DC_RUNNING" = "1" ]; then
+        if docker_caddy_reload; then
+            echo -e "${GREEN}[*] Caddy в контейнере $DC_NAME перечитал конфиг.${NC}"
+        else
+            echo -e "${YELLOW}[!] Caddy не перечитал конфиг: docker restart $DC_NAME${NC}"
+        fi
+    fi
+    return 0
+}
+
 # --- Уже установленный в систему nginx -----------------------------------------
 # Чужие файлы не правим: свой сайт кладём отдельным файлом туда, откуда nginx уже
 # подключает конфиги (conf.d или sites-enabled). Сертификат — certbot через webroot:
@@ -2249,13 +2794,14 @@ ver_ge() {
 }
 
 # Порт, на котором selfsteal для домена $2 уже настроен в системном веб-сервере $1
-# (caddy-system: блок скрипта или ручной блок в Caddyfile; nginx-system: файл скрипта)
+# (caddy-system, caddy-docker: блок скрипта или ручной блок в Caddyfile; nginx-system: файл скрипта)
 selfsteal_host_port() {
-    local ws="$1" domain="$2"
+    local ws="$1" domain="$2" cfg=""
     case "$ws" in
-        caddy-system)
-            [ -f "$HC_CONFIG" ] || return 0
-            grep -oiE "https://${domain//./\\.}:[0-9]+" "$HC_CONFIG" 2>/dev/null | head -n 1 | sed 's/.*://' || true
+        caddy-system|caddy-docker)
+            if [ "$ws" = "caddy-system" ]; then cfg=$HC_CONFIG; else cfg=$DC_CONFIG; fi
+            [ -f "$cfg" ] || return 0
+            grep -oiE "https://${domain//./\\.}:[0-9]+" "$cfg" 2>/dev/null | head -n 1 | sed 's/.*://' || true
             ;;
         nginx-system)
             [ -f "$HN_SITE" ] || return 0
@@ -2618,17 +3164,42 @@ selfsteal_show_errors() {
     fi
 }
 
-# Порты держит только процесс $2? ($1 — вывод port_listener_info)
+# Порты держат только процессы из списка $2 (PID через пробел)? ($1 — вывод port_listener_info)
 listeners_only_pid() {
     [ -n "$1" ] && [ -n "$2" ] || return 1
-    ! echo "$1" | grep -v "pid=$2," | grep -q .
+    local rest="$1" p
+    for p in $2; do
+        rest=$(echo "$rest" | grep -v "pid=$p," || true)
+    done
+    [ -z "$rest" ]
+}
+
+# Имена контейнеров, опубликовавших порт $1 на хосте
+port_container() {
+    command -v docker >/dev/null 2>&1 || return 0
+    docker ps --filter "publish=$1" --format '{{.Names}}' 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || true
+}
+
+# Имена остановленных контейнеров, которые публикуют порт $1: запустившись (например, после
+# перезагрузки — restart: always), они займут его. docker ps --filter publish их не видит.
+stopped_port_containers() {
+    local id line name out=""
+    command -v docker >/dev/null 2>&1 || return 0
+    for id in $(docker ps -aq --filter status=exited --filter status=created 2>/dev/null || true); do
+        line=$(docker container inspect -f '{{.Name}}|{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}},{{end}}{{end}}' "$id" 2>/dev/null) || continue
+        name=${line%%|*}; name=${name#/}
+        if [[ ",${line#*|}" == *",$1,"* ]]; then out="${out:+$out }$name"; fi
+    done
+    echo "$out"
 }
 
 # Проверки перед установкой. Возвращает 1, если пользователь решил не продолжать.
-# $3 — PID системного веб-сервера, в который встраиваемся, $4 — его имя: его 80/tcp — не помеха.
+# $3 — PID (через пробел) веб-сервера, в который встраиваемся, $4 — его имя: его 80/tcp — не помеха.
 # $5=1 — локальный порт уже занят прежним selfsteal этого веб-сервера, его можно заменить.
+# $6 — режим (caddy-docker: проверяются и порты, которые публикует контейнер Caddy).
 selfsteal_preflight() {
-    local domain="$1" port="$2" own_pid="${3:-}" own_name="${4:-веб-сервер}" reuse_port="${5:-0}" server_ip domain_ip busy answer problems=0
+    local domain="$1" port="$2" own_pid="${3:-}" own_name="${4:-веб-сервер}" reuse_port="${5:-0}" ws="${6:-}"
+    local server_ip domain_ip busy answer problems=0 holder p
     local node_compose="/opt/remnanode/docker-compose.yml"
     echo -e "\n${CYAN}[*] Проверка перед установкой...${NC}"
 
@@ -2653,17 +3224,37 @@ selfsteal_preflight() {
     busy=$(port_listener_info 80)
     if listeners_only_pid "$busy" "$own_pid"; then
         echo -e "${GREEN}[*] ✅ Порт 80/tcp держит этот $own_name — он и получит сертификат.${NC}"
+    elif [ -z "$busy" ] && [ "$ws" = "caddy-docker" ] && [ "$DC_RUNNING" = "1" ]; then
+        echo -e "${GREEN}[*] ✅ Порт 80/tcp публикует контейнер $DC_NAME — его Caddy и получит сертификат.${NC}"
     elif [ -n "$busy" ]; then
         echo -e "${RED}[!] Порт 80/tcp занят — он нужен сайту для получения сертификата:${NC}"
         echo "$busy" | sed 's/^/    /'
-        if echo "$busy" | grep -q '"caddy"'; then
-            echo -e "${YELLOW}    Это Caddy. Если он установлен в систему — запустите установку заново и${NC}"
-            echo -e "${YELLOW}    согласитесь встроить selfsteal в него. Caddy в чужом Docker-контейнере${NC}"
-            echo -e "${YELLOW}    скрипт настроить не умеет.${NC}"
+        holder=$(port_container 80)
+        if [ -n "$holder" ]; then
+            echo -e "${YELLOW}    Порт опубликован Docker-контейнером: $holder${NC}"
+        fi
+        if echo "$busy" | grep -q '"caddy"' || { [ -n "${DC_NAME:-}" ] && [[ " $holder " == *" $DC_NAME "* ]]; }; then
+            echo -e "${YELLOW}    Это Caddy. Запустите установку заново и согласитесь встроить selfsteal в него:${NC}"
+            echo -e "${YELLOW}    скрипт умеет и системный Caddy, и Caddy в Docker-контейнере (например, у панели).${NC}"
         fi
         problems=1
     else
         echo -e "${GREEN}[*] ✅ Порт 80/tcp свободен.${NC}"
+    fi
+    # Свободен он может быть только потому, что его хозяин сейчас остановлен
+    holder=""
+    for p in $(stopped_port_containers 80); do
+        if [ "$ws" = "caddy-docker" ] && [ "$p" = "$DC_NAME" ]; then continue; fi
+        holder="${holder:+$holder }$p"
+    done
+    if [ -n "$holder" ]; then
+        echo -e "${RED}[!] 80/tcp публикует остановленный контейнер: $holder. Когда он запустится${NC}"
+        echo -e "${RED}    (например, после перезагрузки), с сайтом selfsteal они не уживутся.${NC}"
+        if [ -n "${DC_NAME:-}" ] && [[ " $holder " == *" $DC_NAME "* ]]; then
+            echo -e "${YELLOW}    В $DC_NAME — Caddy. Запустите установку заново и согласитесь встроить selfsteal${NC}"
+            echo -e "${YELLOW}    в него: второй Caddy на этом сервере не нужен.${NC}"
+        fi
+        problems=1
     fi
 
     # Занятый порт годится, только если на нём уже selfsteal этого же веб-сервера ($5=1)
@@ -2679,14 +3270,38 @@ selfsteal_preflight() {
         problems=1
     fi
 
+    # Остановленный контейнер Caddy должен суметь занять свои порты (80, 443 и порт сайта — ниже и выше)
+    if [ "$ws" = "caddy-docker" ] && [ "$DC_RUNNING" != "1" ]; then
+        for p in $(dc_host_ports); do
+            if [ "$p" = "80" ] || [ "$p" = "443" ] || [ "$p" = "$port" ]; then continue; fi
+            busy=$(port_listener_info "$p")
+            if [ -n "$busy" ]; then
+                echo -e "${RED}[!] Контейнер $DC_NAME не запустится: его порт $p/tcp уже занят:${NC}"
+                echo "$busy" | sed 's/^/    /'
+                problems=1
+            fi
+        done
+    fi
+
     busy=$(port_listener_info 443)
-    if [ -z "$busy" ]; then
+    holder=$(port_container 443)
+    if [ "$ws" = "caddy-docker" ] && dc_host_ports | grep -qx 443; then
+        echo -e "${RED}[!] Контейнер $DC_NAME публикует 443/tcp — Xray (Reality) на этом порту не запустится.${NC}"
+        echo -e "${YELLOW}    Уберите 443 из ports контейнера в ${DC_BASE_FILES[0]:-его compose-файле}. Панель тогда${NC}"
+        echo -e "${YELLOW}    откроется через Xray: Reality отдаёт сайту на 127.0.0.1:$port подключения с чужим SNI —${NC}"
+        echo -e "${YELLOW}    добавьте адресу панели в Caddyfile второй адрес с этим портом:${NC}"
+        echo -e "${YELLOW}    https://<домен панели>, https://<домен панели>:$port { ... }${NC}"
+        problems=1
+    elif [ -z "$busy" ]; then
         echo -e "${CYAN}[*] Порт 443/tcp пока свободен — его займёт Xray, когда вы добавите inbound в панели.${NC}"
     elif echo "$busy" | grep -qE 'xray|rw-core'; then
         echo -e "${GREEN}[*] ✅ Порт 443/tcp слушает Xray.${NC}"
     else
         echo -e "${RED}[!] Порт 443/tcp занят НЕ Xray — inbound на 443 не запустится:${NC}"
         echo "$busy" | sed 's/^/    /'
+        if [ -n "$holder" ]; then
+            echo -e "${YELLOW}    Порт опубликован Docker-контейнером: $holder — уберите 443 из его ports.${NC}"
+        fi
         problems=1
     fi
 
@@ -2709,9 +3324,10 @@ selfsteal_preflight() {
 selfsteal_install() {
     echo -e "\n${CYAN}=== Установка selfsteal-сайта ===${NC}"
 
-    local old_domain="" old_ws="" old_port="" old_extra=""
+    local old_domain="" old_ws="" old_port="" old_extra="" old_container=""
     if selfsteal_load_env; then
         old_domain=$SS_DOMAIN; old_ws=$SS_WEBSERVER; old_port=$SS_PORT; old_extra=$SS_EXTRA_SNI
+        old_container=$SS_CADDY_CONTAINER
         echo -e "${YELLOW}[*] Уже установлено: $old_domain ($(selfsteal_ws_label "$old_ws") → 127.0.0.1:$old_port). Будет перенастроено.${NC}"
     fi
 
@@ -2724,15 +3340,23 @@ selfsteal_install() {
         echo -e "${RED}[!] Некорректный домен: '$domain'.${NC}"
     done
 
-    # Уже установленный в систему Caddy или nginx: встраиваемся в него, а не ставим
-    # второй веб-сервер (80/tcp у сервера один)
-    local ws="" ws_choice ws_default=1 answer state hc_ok=0 hn_ok=0
+    # Уже установленный Caddy (в системе или в Docker-контейнере, например у панели) или
+    # nginx: встраиваемся в него, а не ставим второй веб-сервер (80/tcp у сервера один)
+    local ws="" ws_choice ws_default=1 answer state hc_ok=0 dc_ok=0 hn_ok=0 pick=""
     if detect_host_caddy; then
         if [ -n "$HC_PROBLEM" ]; then
             echo -e "\n${YELLOW}[!] На сервере уже есть Caddy${HC_UNIT:+ ($HC_UNIT)}, но встроить selfsteal в него нельзя:${NC}"
             echo -e "${YELLOW}    $HC_PROBLEM.${NC}"
         else
             hc_ok=1
+        fi
+    fi
+    if detect_docker_caddy; then
+        if [ -n "$DC_PROBLEM" ]; then
+            echo -e "\n${YELLOW}[!] На сервере есть Caddy в Docker-контейнере $DC_NAME, но встроить selfsteal в него нельзя:${NC}"
+            echo -e "${YELLOW}    $DC_PROBLEM.${NC}"
+        else
+            dc_ok=1
         fi
     fi
     if detect_host_nginx; then
@@ -2743,18 +3367,49 @@ selfsteal_install() {
             hn_ok=1
         fi
     fi
-    # Есть оба — предлагаем тот, что работает
-    if [ "$hc_ok" = "1" ] && [ "$hn_ok" = "1" ]; then
-        if [ "$HN_RUNNING" = "1" ] && [ "$HC_RUNNING" != "1" ]; then hc_ok=0; else hn_ok=0; fi
+    # Нашлось несколько — предлагаем тот, что работает
+    if [ "$hc_ok" = "1" ] && [ "$HC_RUNNING" = "1" ]; then pick=hc
+    elif [ "$dc_ok" = "1" ] && [ "$DC_RUNNING" = "1" ]; then pick=dc
+    elif [ "$hn_ok" = "1" ] && [ "$HN_RUNNING" = "1" ]; then pick=hn
+    elif [ "$hc_ok" = "1" ]; then pick=hc
+    elif [ "$dc_ok" = "1" ]; then pick=dc
+    elif [ "$hn_ok" = "1" ]; then pick=hn
     fi
-    if [ "$hc_ok" = "1" ]; then
+    if [ "$pick" = "hc" ]; then
         if [ "$HC_RUNNING" = "1" ]; then state="работает"; else state="остановлен"; fi
         echo -e "\n${GREEN}[*] Найден установленный Caddy: ${HC_UNIT:-процесс $HC_PID} ($state), конфиг $HC_CONFIG${NC}"
         echo -e "    Selfsteal можно добавить в него отдельным блоком: остальные сайты в конфиге"
         echo -e "    не трогаются, Caddy перечитает настройки без остановки."
         read -p "Встроить selfsteal в этот Caddy? (Y/n): " answer || return 0
         if [[ ! "$answer" =~ ^[Nn]$ ]]; then ws="caddy-system"; fi
-    elif [ "$hn_ok" = "1" ]; then
+    elif [ "$pick" = "dc" ]; then
+        if [ "$DC_RUNNING" = "1" ]; then state="работает"; else state="остановлен"; fi
+        echo -e "\n${GREEN}[*] Найден Caddy в Docker-контейнере $DC_NAME ($state), конфиг $DC_CONFIG${NC}"
+        echo -e "    Selfsteal можно добавить в него отдельным блоком: остальные сайты (например,"
+        echo -e "    панель) не трогаются. Второй Caddy на этом сервере не нужен — и не встанет:"
+        echo -e "    80/tcp у сервера один."
+        if [ "$DC_COMPOSE" = "1" ]; then
+            if [ "$DC_NET" = "host" ]; then
+                echo -e "    Страницу selfsteal скрипт подключит к контейнеру отдельным файлом"
+            else
+                echo -e "    Страницу selfsteal и порт 127.0.0.1:<порт> скрипт подключит к контейнеру файлом"
+            fi
+            echo -e "    $DC_OVERRIDE — ваш ${DC_BASE_FILES[0]##*/} не меняется."
+            if [ ! -f "$DC_OVERRIDE" ]; then
+                echo -e "    Для этого контейнер пересоздаётся: сайты на нём прервутся на пару секунд."
+            fi
+        else
+            echo -e "    Контейнер запущен не через docker compose: страница $SELFSTEAL_DIR/html"
+            if [ "$DC_NET" = "host" ]; then
+                echo -e "    должна быть уже смонтирована в него (-v), иначе скрипт подскажет, как его пересоздать."
+            else
+                echo -e "    и порт 127.0.0.1:<порт> должны быть у него уже подключены (-v, -p), иначе скрипт"
+                echo -e "    подскажет, как его пересоздать."
+            fi
+        fi
+        read -p "Встроить selfsteal в Caddy контейнера $DC_NAME? (Y/n): " answer || return 0
+        if [[ ! "$answer" =~ ^[Nn]$ ]]; then ws="caddy-docker"; fi
+    elif [ "$pick" = "hn" ]; then
         if [ "$HN_RUNNING" = "1" ]; then state="работает"; else state="остановлен"; fi
         echo -e "\n${GREEN}[*] Найден установленный nginx ${HN_VER}: ${HN_UNIT:-процесс $HN_PID} ($state), конфиг $HN_CONF${NC}"
         echo -e "    Selfsteal можно добавить в него отдельным файлом ($HN_SITE): остальные сайты"
@@ -2830,8 +3485,9 @@ selfsteal_install() {
     # Занятый порт можно переиспользовать, только если там уже selfsteal этого веб-сервера
     if [ -n "$host_port" ] && [ "$port" = "$host_port" ]; then reuse_port=1; fi
     if [ "$ws" = "caddy-system" ] && [ "$HC_RUNNING" = "1" ]; then own_pid=$HC_PID; own_name="Caddy"; fi
+    if [ "$ws" = "caddy-docker" ] && [ "$DC_RUNNING" = "1" ]; then own_pid=$(dc_pids); own_name="Caddy (контейнер $DC_NAME)"; fi
     if [ "$ws" = "nginx-system" ] && [ "$HN_RUNNING" = "1" ]; then own_pid=$HN_PID; own_name="nginx"; fi
-    if ! selfsteal_preflight "$domain" "$port" "$own_pid" "$own_name" "$reuse_port"; then
+    if ! selfsteal_preflight "$domain" "$port" "$own_pid" "$own_name" "$reuse_port" "$ws"; then
         echo -e "${YELLOW}[*] Установка отменена.${NC}"
         selfsteal_resume
         pause_enter
@@ -2876,6 +3532,12 @@ selfsteal_install() {
         pause_enter
         return 0
     fi
+    if [ "$ws" = "caddy-docker" ] && ! docker_caddy_apply "$domain" "$port"; then
+        echo -e "${RED}[!] Selfsteal в Caddy контейнера $DC_NAME не добавлен, его настройки не изменены.${NC}"
+        selfsteal_resume
+        pause_enter
+        return 0
+    fi
     if [ "$ws" = "nginx-system" ] && ! host_nginx_apply "$domain" "$port"; then
         echo -e "${RED}[!] Selfsteal в nginx не добавлен, его конфиг не изменён.${NC}"
         selfsteal_resume
@@ -2884,6 +3546,10 @@ selfsteal_install() {
     fi
     # Смена режима — убираем свою настройку из прежнего системного веб-сервера
     if [ "$old_ws" = "caddy-system" ] && [ "$ws" != "caddy-system" ]; then host_caddy_remove_block; fi
+    if [ "$old_ws" = "caddy-docker" ] && { [ "$ws" != "caddy-docker" ] || [ "$old_container" != "$DC_NAME" ]; }; then
+        # В подоболочке: прежний контейнер не должен затереть сведения о текущем (DC_*)
+        ( docker_caddy_remove_block "$old_container" ) || true
+    fi
     if [ "$old_ws" = "nginx-system" ] && [ "$ws" != "nginx-system" ]; then host_nginx_remove_site; fi
 
     # Прежние контейнеры убираем (смена Caddy <-> Nginx или переезд в системный Caddy)
@@ -2900,17 +3566,21 @@ selfsteal_install() {
     SELFSTEAL_PAUSED=""
 
     SS_DOMAIN=$domain; SS_WEBSERVER=$ws; SS_PORT=$port
-    SS_CADDYFILE=""; SS_CADDY_UNIT=""; SS_NGINX_SITE=""; SS_NGINX_LINK=""; SS_NGINX_UNIT=""
+    SS_CADDYFILE=""; SS_CADDY_UNIT=""; SS_CADDY_CONTAINER=""; SS_CADDY_OVERRIDE=""
+    SS_NGINX_SITE=""; SS_NGINX_LINK=""; SS_NGINX_UNIT=""
     if [ "$domain" = "$old_domain" ]; then SS_EXTRA_SNI=$old_extra; else SS_EXTRA_SNI=""; fi
 
-    if [ "$ws" = "caddy-system" ] || [ "$ws" = "nginx-system" ]; then
+    if [ "$ws" = "caddy-system" ] || [ "$ws" = "caddy-docker" ] || [ "$ws" = "nginx-system" ]; then
         if [ "$ws" = "caddy-system" ]; then
             SS_CADDYFILE=$HC_CONFIG; SS_CADDY_UNIT=$HC_UNIT
+        elif [ "$ws" = "caddy-docker" ]; then
+            SS_CADDYFILE=$DC_CONFIG; SS_CADDY_CONTAINER=$DC_NAME
+            if [ "$DC_COMPOSE" = "1" ]; then SS_CADDY_OVERRIDE=$DC_OVERRIDE; fi
         else
             SS_NGINX_SITE=$HN_SITE; SS_NGINX_LINK=$HN_LINK; SS_NGINX_UNIT=$HN_UNIT
         fi
         rm -f "$SELFSTEAL_DIR/docker-compose.yml" "$SELFSTEAL_DIR/Caddyfile" "$SELFSTEAL_DIR/nginx.conf"
-        # Хуки останавливали контейнеры скрипта — системный веб-сервер они не трогают, они не нужны
+        # Хуки останавливали контейнеры скрипта — чужой веб-сервер они не трогают, они не нужны
         selfsteal_remove_renew_hooks
         selfsteal_save_env
     else
@@ -2939,6 +3609,7 @@ selfsteal_install() {
 
     local logsrc="selfsteal-$ws" timeout=20
     if [ "$ws" = "caddy-system" ]; then logsrc=$HC_UNIT; fi
+    if [ "$ws" = "caddy-docker" ]; then logsrc=$DC_NAME; fi
     if [ "$ws" = "nginx-system" ]; then logsrc="/var/log/nginx/error.log"; fi
     if [ "$ws" = "nginx" ] || [ "$ws" = "nginx-system" ]; then
         echo -ne "${CYAN}[*] Жду ответа сайта${NC}"
@@ -2968,7 +3639,7 @@ selfsteal_install() {
                 echo -e "${YELLOW}    пункт 8 главного меню покажет, где режется трафик. Если 80/tcp закрыт${NC}"
                 echo -e "${YELLOW}    хостером — переустановите с Nginx: он умеет DNS-01 через Cloudflare.${NC}"
                 ;;
-            caddy-system)
+            caddy-system|caddy-docker)
                 echo -e "${YELLOW}    Caddy будет повторять попытки сам. Частая причина — недоступен 80/tcp снаружи.${NC}"
                 echo -e "${YELLOW}    Проверьте с другого сервера: curl -I http://$domain/ — должен прийти ответ 301.${NC}"
                 ;;
@@ -2983,6 +3654,23 @@ selfsteal_install() {
     if [ "$ws" = "caddy-system" ]; then
         echo -e "${GREEN}✅ Selfsteal встроен в системный Caddy: $domain → 127.0.0.1:$port${NC}"
         echo -e "    Блок между метками «remnautility selfsteal» в $HC_CONFIG — остальное не тронуто."
+    elif [ "$ws" = "caddy-docker" ]; then
+        echo -e "${GREEN}✅ Selfsteal встроен в Caddy контейнера $DC_NAME: $domain → 127.0.0.1:$port${NC}"
+        echo -e "    Блок между метками «remnautility selfsteal» в $DC_CONFIG — остальное не тронуто."
+        if [ "$DC_COMPOSE" = "1" ]; then
+            if [ "$DC_NET" = "host" ]; then
+                echo -e "    Страница подключена к контейнеру файлом $DC_OVERRIDE."
+            else
+                echo -e "    Страница и порт подключены к контейнеру файлом $DC_OVERRIDE."
+            fi
+            if [ "$DC_AUTOLOAD" = "1" ]; then
+                echo -e "    docker compose в $DC_WORKDIR подхватывает его сам — пересоздавайте контейнер как обычно."
+            else
+                echo -e "${YELLOW}    docker compose сам его не подхватит: пересоздавайте контейнер только так:${NC}"
+                echo -e "${YELLOW}    cd $DC_WORKDIR && docker compose$(printf ' -f %s' "${DC_BASE_FILES[@]}") -f $DC_OVERRIDE up -d $DC_SERVICE${NC}"
+                echo -e "${YELLOW}    Иначе контейнер потеряет страницу и порт selfsteal.${NC}"
+            fi
+        fi
     elif [ "$ws" = "nginx-system" ]; then
         echo -e "${GREEN}✅ Selfsteal встроен в системный nginx: $domain → 127.0.0.1:$port${NC}"
         echo -e "    Отдельный файл $HN_SITE — остальные сайты nginx не тронуты."
@@ -3130,12 +3818,15 @@ selfsteal_status() {
         return 0
     fi
 
-    local container="selfsteal-$SS_WEBSERVER" state server_ip domain_ip code cert issuer not_after exp_ts days
+    local container="selfsteal-$SS_WEBSERVER" state server_ip domain_ip code cert issuer not_after exp_ts days busy
     local logsrc=$container
     echo -e "  Домен:       $SS_DOMAIN"
     if [ "$SS_WEBSERVER" = "caddy-system" ]; then
         logsrc=$SS_CADDY_UNIT
         echo -e "  Веб-сервер:  системный Caddy (${SS_CADDY_UNIT:-без systemd}, $SS_CADDYFILE)"
+    elif [ "$SS_WEBSERVER" = "caddy-docker" ]; then
+        logsrc=$SS_CADDY_CONTAINER
+        echo -e "  Веб-сервер:  Caddy из контейнера $SS_CADDY_CONTAINER ($SS_CADDYFILE)"
     elif [ "$SS_WEBSERVER" = "nginx-system" ]; then
         logsrc="/var/log/nginx/error.log"
         echo -e "  Веб-сервер:  системный nginx (${SS_NGINX_UNIT:-без systemd}, $SS_NGINX_SITE)"
@@ -3164,6 +3855,47 @@ selfsteal_status() {
             echo -e "${GREEN}[*] ✅ Блок selfsteal есть в $SS_CADDYFILE.${NC}"
         else
             echo -e "${RED}[!] В ${SS_CADDYFILE:-Caddyfile} нет блока selfsteal — переустановите (пункт 1).${NC}"
+        fi
+    elif [ "$SS_WEBSERVER" = "caddy-docker" ]; then
+        state=""
+        if dc_inspect "$SS_CADDY_CONTAINER"; then
+            if [ "$DC_RUNNING" = "1" ]; then
+                state="running"
+                echo -e "${GREEN}[*] ✅ Контейнер $DC_NAME работает.${NC}"
+            else
+                echo -e "${RED}[!] Контейнер $DC_NAME остановлен.${NC}"
+                if [ "$DC_COMPOSE" = "1" ]; then
+                    echo -e "${YELLOW}    Запуск: cd $DC_WORKDIR && docker compose$(printf ' -f %s' "${DC_BASE_FILES[@]}") -f $DC_OVERRIDE up -d $DC_SERVICE${NC}"
+                else
+                    echo -e "${YELLOW}    Запуск: docker start $DC_NAME${NC}"
+                fi
+                busy=$(port_listener_info 80)
+                if [ -n "$busy" ]; then
+                    echo -e "${YELLOW}    Порт 80/tcp сейчас занят — контейнер на нём не встанет:${NC}"
+                    echo "$busy" | sed 's/^/      /'
+                fi
+            fi
+        else
+            echo -e "${RED}[!] Контейнер ${SS_CADDY_CONTAINER:-Caddy} не найден — переустановите selfsteal (пункт 1).${NC}"
+        fi
+        if [ -f "$SS_CADDYFILE" ] && grep -qF "$SELFSTEAL_MARK_BEGIN" "$SS_CADDYFILE"; then
+            echo -e "${GREEN}[*] ✅ Блок selfsteal есть в $SS_CADDYFILE.${NC}"
+        else
+            echo -e "${RED}[!] В ${SS_CADDYFILE:-Caddyfile} нет блока selfsteal — переустановите (пункт 1).${NC}"
+        fi
+        if [ "$state" = "running" ]; then
+            if ! docker exec "$DC_NAME" cat "$DC_CONFIG_IN" 2>/dev/null | grep -qF "$SELFSTEAL_MARK_BEGIN"; then
+                echo -e "${RED}[!] Контейнер не видит блок selfsteal в $DC_CONFIG_IN (файл заменяли целиком?):${NC}"
+                echo -e "${RED}    перезапустите его: docker restart $DC_NAME${NC}"
+            fi
+            if [ -z "$DC_HTML_IN" ]; then
+                echo -e "${RED}[!] Страница $SELFSTEAL_DIR/html не смонтирована в контейнер — его пересоздали без${NC}"
+                echo -e "${RED}    ${DC_OVERRIDE:-override-файла}. Переустановите selfsteal (пункт 1).${NC}"
+            elif [ "$DC_NET" != "host" ] && ! dc_publishes_local "$SS_PORT"; then
+                echo -e "${RED}[!] Контейнер не пробрасывает 127.0.0.1:$SS_PORT — переустановите selfsteal (пункт 1).${NC}"
+            else
+                echo -e "${GREEN}[*] ✅ Страница смонтирована в контейнер ($DC_HTML_IN).${NC}"
+            fi
         fi
     elif [ "$SS_WEBSERVER" = "nginx-system" ]; then
         state=""
@@ -3235,7 +3967,7 @@ selfsteal_status() {
         fi
     fi
 
-    local l443
+    local l443 holder
     l443=$(port_listener_info 443)
     if [ -z "$l443" ]; then
         echo -e "${YELLOW}[!] Порт 443/tcp никто не слушает — inbound ещё не добавлен в профиль ноды.${NC}"
@@ -3245,6 +3977,10 @@ selfsteal_status() {
         else
             echo -e "${RED}[!] Порт 443/tcp слушает не Xray:${NC}"
             echo "$l443" | sed 's/^/    /'
+            holder=$(port_container 443)
+            if [ -n "$holder" ]; then
+                echo -e "${YELLOW}    Порт опубликован Docker-контейнером: $holder — уберите 443 из его ports.${NC}"
+            fi
         fi
         # Полная цепочка: клиент → Xray(443) → сайт. Так же увидит сайт браузер.
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
@@ -3283,7 +4019,7 @@ selfsteal_remove() {
     selfsteal_load_env || true
 
     local answer c down_args=(down --remove-orphans)
-    if [ -f "$HYST_SYNC_BIN" ] && { [ "$SS_WEBSERVER" = "caddy" ] || [ "$SS_WEBSERVER" = "caddy-system" ]; }; then
+    if [ -f "$HYST_SYNC_BIN" ] && [[ "$SS_WEBSERVER" == caddy* ]]; then
         echo -e "${YELLOW}[!] Hysteria2 на этой ноде берёт сертификат у Caddy. После удаления selfsteal${NC}"
         echo -e "${YELLOW}    он перестанет продлеваться — перенастройте Hysteria2 (пункт 2 главного меню).${NC}"
     fi
@@ -3293,6 +4029,10 @@ selfsteal_remove() {
     if [ "$SS_WEBSERVER" = "caddy-system" ]; then
         # Сам Caddy и остальные его сайты не трогаем — убираем только свой блок
         host_caddy_remove_block
+    fi
+    if [ "$SS_WEBSERVER" = "caddy-docker" ]; then
+        # Контейнер и остальные его сайты (например, панель) не трогаем — убираем свой блок и override
+        docker_caddy_remove_block "$SS_CADDY_CONTAINER"
     fi
     if [ "$SS_WEBSERVER" = "nginx-system" ]; then
         # Сам nginx и остальные его сайты не трогаем — убираем только свой файл
